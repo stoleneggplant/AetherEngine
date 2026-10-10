@@ -573,6 +573,7 @@ public final class AetherEngine: ObservableObject {
     /// The Dolby Vision profile rewrite applied to the served stream, nil when the session serves the source's
     /// own profile (or no Dolby Vision). `.profile7ToProfile81` on every Profile 7 source not served as its
     /// base layer, whatever the display; `sourceDVProfile` keeps 7.
+    /// `.profile7FELComposedToProfile81` when a Profile 7 FEL plays dual-layer on the software host.
     @Published public internal(set) var dolbyVisionConversion: DolbyVisionConversion? = nil
 
     /// A HDR10+ (ST 2094-40) T.35 payload was seen in this session's video, whatever the source's format.
@@ -592,6 +593,10 @@ public final class AetherEngine: ObservableObject {
     /// RPU could not be read. Held for the same reason as `sourceDVBLCompatID`: a reload has to judge the
     /// source after the probe that measured it is gone.
     var sourceDolbyVisionRPUProfile: Int? = nil
+
+    /// This session composes a Dolby Vision Profile 7 FEL on the software host (`DolbyVisionFELPolicy`).
+    /// Decided by `load` and kept across in-place rebuilds, which reach `loadSoftware` without routing.
+    var sourceComposesDolbyVisionFEL = false
 
     /// AE#541: the two load-time terms of the HDR route that a reload cannot take again. The criteria
     /// readout is only an answer around the handshake, and an in-place rebuild runs none, so an audio
@@ -4237,6 +4242,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceComposesDolbyVisionFEL = false
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
@@ -5142,6 +5148,55 @@ public final class AetherEngine: ObservableObject {
             useSoftwarePath = true
             EngineLog.emit("[AetherEngine] TEST override: forcing software path", category: .engine)
         }
+        // Dolby Vision Profile 7 FEL: both layers decoded and composed on the software host instead of
+        // converted to single-layer 8.1 on the native path, when everything the composition needs is
+        // there (`DolbyVisionFELPolicy`). The enhancement-layer type is read from the first RPU through
+        // a second open, paid only by a Profile 7 that passed every other gate; a custom reader has no
+        // second open to give and keeps the conversion.
+        var composesFEL = false
+        if probeOpened, detectedCodecID == AV_CODEC_ID_HEVC,
+           let vStream = probe.stream(at: probe.videoStreamIndex),
+           let codecpar = vStream.pointee.codecpar {
+            let framing = A53SEIParser.nalFraming(
+                codec: .hevc, extradata: codecpar.pointee.extradata,
+                size: Int(codecpar.pointee.extradata_size))
+            var felInputs = DolbyVisionFELPolicy.Inputs(
+                dvProfile: correctedDVProfile ?? detectedDVProfileNum,
+                enhancementLayerType: nil,
+                displayPresentsDolbyVision: sessionDisplayCaps.supportsDolbyVision,
+                presentsBaseLayerOnly: presentsDolbyVisionBaseLayer,
+                hostAllowsComposition: options.composesDolbyVisionEnhancementLayer,
+                isLive: options.isLive,
+                sourceIsSeekable: probe.isSourceSeekable,
+                samplesAreLengthPrefixed: framing == .lengthPrefixed(size: 4),
+                hardwareCanCompose: false)
+            if DolbyVisionFELPolicy.worthAuditing(felInputs), case .url(let felURL) = source {
+                felInputs.hardwareCanCompose = DolbyVisionFELDecoder.deviceCanCompose
+                if felInputs.hardwareCanCompose {
+                    let felHeaders = options.httpHeaders
+                    felInputs.enhancementLayerType = await BlockingWork.detached(priority: .userInitiated) {
+                        DolbyVisionRecordAudit.enhancementLayerTypeOfSource(url: felURL, extraHeaders: felHeaders)
+                    }.value
+                    if loadGeneration != gen {
+                        probe.markClosed()
+                        BlockingWork.detached { [probe] in probe.close() }
+                        try checkLoadCurrent(gen)
+                    }
+                }
+                composesFEL = DolbyVisionFELPolicy.composes(felInputs)
+                EngineLog.emit(
+                    composesFEL
+                        ? "[AetherEngine] DV Profile 7 FEL on a Dolby Vision display: composing base + "
+                          + "enhancement layers on the software host (VideoToolbox decode, Metal composition, "
+                          + "P010 with per-frame Profile 8.1 metadata)"
+                        : "[AetherEngine] DV Profile 7 keeps the single-layer 8.1 conversion: enhancement layer "
+                          + (felInputs.enhancementLayerType ?? "unread")
+                          + (felInputs.hardwareCanCompose ? "" : ", no Metal GPU or hardware HEVC decode"),
+                    category: .engine)
+            }
+            if composesFEL { useSoftwarePath = true }
+        }
+        sourceComposesDolbyVisionFEL = composesFEL
         EngineLog.emit("[AetherEngine] dispatch: codec=\(detectedCodecID.rawValue) → \(useSoftwarePath ? "software" : "native")", category: .engine)
         // #361: routing is settled here and not at the first `useSoftwarePath` assignment; the
         // interlace refute probe and the VideoToolbox capability probe above can both overturn it,
@@ -5222,9 +5277,9 @@ public final class AetherEngine: ObservableObject {
                         category: .engine
                     )
                 }
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: detectedCodecID, isSoftware: true
-                )
+                activeVideoDecoder = composesFEL
+                    ? Self.dolbyVisionFELDecoderLabel
+                    : Self.videoDecoderLabel(codecID: detectedCodecID, isSoftware: true)
                 // AE#462: the host's own resolved index, not the engine's pick. The pick says which
                 // track was ASKED for; only the host knows whether a decoder opened for it, and this
                 // label claimed one for a session that had dropped its audio and gone video-only.
@@ -6437,6 +6492,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceComposesDolbyVisionFEL = false
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil

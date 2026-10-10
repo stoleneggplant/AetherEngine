@@ -449,6 +449,25 @@ public struct LoadOptions: Sendable, Equatable {
     /// contradicts.
     public var dolbyVisionHandling: DolbyVisionHandling
 
+    /// Whether a Dolby Vision Profile 7 source with a Full Enhancement Layer (FEL) is played dual-layer.
+    /// Default `true`. When it is, and the display presents Dolby Vision, the device has a Metal GPU and
+    /// hardware HEVC decode, and the source is a seekable VOD with length-prefixed samples, the session
+    /// runs on the software host: VideoToolbox decodes the base and enhancement layers, a Metal kernel
+    /// reconstructs the picture from the RPU's reshaping curves and the residual's NLQ parameters, the
+    /// 12-bit result is requantized to 10-bit P010 with an ordered dither, and the frames are presented
+    /// through `AVSampleBufferDisplayLayer` carrying per-frame Profile 8.1 Dolby Vision metadata, so the
+    /// system does the display management. `dolbyVisionConversion` then reads
+    /// `.profile7FELComposedToProfile81`.
+    ///
+    /// `false` keeps every Profile 7 on the single-layer Profile 8.1 conversion of the native path,
+    /// which discards the enhancement layer. That is also what a Minimal Enhancement Layer (MEL) source
+    /// and every device or display without the requirements above get, whatever this says. The trade a
+    /// host is choosing here: the composed picture keeps the residual the FEL was mastered with, while
+    /// the software host renders on the device only (AirPlay carries its sound, not its picture) and has
+    /// no Atmos passthrough. A load identity field: it picks the host, so `reloadAtCurrentPosition(applying:)`
+    /// refuses to change it and the next load takes it.
+    public var composesDolbyVisionEnhancementLayer: Bool
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -930,6 +949,7 @@ public struct LoadOptions: Sendable, Equatable {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        composesDolbyVisionEnhancementLayer: Bool = true,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -980,6 +1000,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.composesDolbyVisionEnhancementLayer = composesDolbyVisionEnhancementLayer
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
@@ -1041,6 +1062,10 @@ public enum DolbyVisionConversion: Sendable, Equatable {
     /// without Dolby Vision gets the RPU-driven tone map a Profile 8.1 gets). The enhancement layer is
     /// discarded: a MEL carries next to nothing, a FEL loses its refinement.
     case profile7ToProfile81
+    /// Dual-layer Profile 7 with a Full Enhancement Layer, both layers decoded and composed on the GPU
+    /// into the picture the FEL was mastered to, and presented as Profile 8.1 (the composed signal with
+    /// the RPU's display management metadata). See `LoadOptions.composesDolbyVisionEnhancementLayer`.
+    case profile7FELComposedToProfile81
 }
 
 /// One-shot container + stream metadata from `AetherEngine.probe(url:options:)`. No HLS server, no decoders.

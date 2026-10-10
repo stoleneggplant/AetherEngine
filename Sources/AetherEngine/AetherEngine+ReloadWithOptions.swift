@@ -276,6 +276,7 @@ enum SessionOptionCorrection {
         "sequentialOrigin",
         "heldSourceConnection",
         "sharedOutputRole",
+        "composesDolbyVisionEnhancementLayer",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -314,6 +315,11 @@ enum SessionOptionCorrection {
         // accepted and then not happen until something else reopened the source.
         if proposed.heldSourceConnection != current.heldSourceConnection {
             refused.append("heldSourceConnection")
+        }
+        // Whether a Profile 7 FEL composes decides which host serves it (the software host composes,
+        // the native path converts), and a rebuild keeps the host it is on.
+        if proposed.composesDolbyVisionEnhancementLayer != current.composesDolbyVisionEnhancementLayer {
+            refused.append("composesDolbyVisionEnhancementLayer")
         }
         return refused
     }
@@ -390,7 +396,8 @@ enum SessionOptionCorrection {
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling",
+        "composesDolbyVisionEnhancementLayer", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",

@@ -921,7 +921,16 @@ final class SoftwarePlaybackHost {
         // HW decoder must go to libavcodec. AE#461: so must every format the probe cannot classify (in-band
         // parameter sets, Annex-B extradata), which the routing gate reads as "keep native" but which
         // HardwareVideoDecoder, building from the hvcC alone, can never open.
-        if let codecpar = vStream.pointee.codecpar,
+        if composesDolbyVisionFEL,
+           let codecpar = vStream.pointee.codecpar,
+           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC {
+            videoDecoder.close()
+            videoDecoder = DolbyVisionFELDecoder()
+            EngineLog.emit(
+                "[SWHost] selected DolbyVisionFELDecoder (VT base + enhancement layers, Metal composition)",
+                category: .swPlayback
+            )
+        } else if let codecpar = vStream.pointee.codecpar,
            codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
            VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder {
             videoDecoder.close()
@@ -941,7 +950,8 @@ final class SoftwarePlaybackHost {
         }
 
         // Audit PERF-104: only the VideoToolbox decoder emits out of presentation order.
-        renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(forHardwareDecoder: videoDecoder is HardwareVideoDecoder))
+        renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(
+            forHardwareDecoder: videoDecoder is HardwareVideoDecoder || videoDecoder is DolbyVisionFELDecoder))
 
         // Flip display layer into HDR mode before frames arrive; without this preferredDynamicRange stays .standard and PQ/HLG renders desaturated.
         if let codecpar = vStream.pointee.codecpar {
@@ -1220,6 +1230,9 @@ final class SoftwarePlaybackHost {
     var preserveASSMarkupForSubtitleTap = false
     var teletextPageForSubtitleTap: Int? = nil
     var deinterlaceConfig = DeinterlaceConfig()
+    /// Set by the engine before `load` when the session composes a Dolby Vision Profile 7 FEL
+    /// (`DolbyVisionFELPolicy`): the video decoder is then `DolbyVisionFELDecoder`.
+    var composesDolbyVisionFEL = false
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.

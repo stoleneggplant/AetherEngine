@@ -787,6 +787,9 @@ extension AetherEngine {
     // MARK: - Decoder identity helpers
 
     /// User-facing label for the active video decoder. nil when no video track (AV_CODEC_ID_NONE). Native = VideoToolbox HW; SW = dav1d (AV1) or libavcodec (VP9, MPEG-2, VC-1).
+    /// The software host's decoder for a composed Dolby Vision Profile 7 FEL session.
+    static let dolbyVisionFELDecoderLabel = "VideoToolbox HEVC BL + FEL (HW, Metal composition)"
+
     static func videoDecoderLabel(codecID: AVCodecID, isSoftware: Bool) -> String? {
         guard codecID != AV_CODEC_ID_NONE else { return nil }
         let name: String = {

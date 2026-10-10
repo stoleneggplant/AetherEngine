@@ -1916,6 +1916,7 @@ extension AetherEngine {
         // and only a second write mid-session took effect.
         let host = SoftwarePlaybackHost(videoGravity: _videoGravity)
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
+        host.composesDolbyVisionFEL = sourceComposesDolbyVisionFEL
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate
@@ -2061,6 +2062,9 @@ extension AetherEngine {
         if loadGeneration != generation {
             host.stop()
             try checkLoadCurrent(generation)
+        }
+        if sourceComposesDolbyVisionFEL {
+            dolbyVisionConversion = .profile7FELComposedToProfile81
         }
     }
 
@@ -2509,9 +2513,9 @@ extension AetherEngine {
                 EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .software
                 activeAudioTrackIndex = audioStreamIndex.map { Int($0) }
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: preservedVideoCodec, isSoftware: true
-                )
+                activeVideoDecoder = sourceComposesDolbyVisionFEL
+                    ? Self.dolbyVisionFELDecoderLabel
+                    : Self.videoDecoderLabel(codecID: preservedVideoCodec, isSoftware: true)
                 // AE#462: the rebuilt host's own resolved index (see the load site).
                 activeAudioDecoder = Self.softwareAudioDecoderLabel(
                     audioTracks: audioTracks, activeIndex: softwareHost?.audioStreamIndex ?? -1

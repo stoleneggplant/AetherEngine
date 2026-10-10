@@ -10,6 +10,23 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **Dolby Vision Profile 7 FEL plays dual-layer.** The Profile 7 to 8.1 conversion keeps the RPU and
+  discards the enhancement layer, which for a Full Enhancement Layer loses the residual the picture was
+  mastered with. Where the display presents Dolby Vision and the device has a Metal GPU and hardware
+  HEVC decode, a seekable VOD Profile 7 whose first RPU names FEL now runs on the software host:
+  VideoToolbox decodes the base layer (as Profile 8.1, so its pictures carry per-frame Dolby Vision
+  metadata) and the unwrapped enhancement layer, the pictures are paired by presentation time, a Metal
+  kernel rebuilds the 12-bit signal from the RPU's reshaping curves and NLQ residual, and the result is
+  requantized to 10-bit P010 with an ordered dither and presented through `AVSampleBufferDisplayLayer`
+  with the base picture's metadata, the panel asked for `dvh1` through `AVDisplayManager` as before. No
+  re-encode. `dolbyVisionConversion` reads the new `.profile7FELComposedToProfile81`. MEL sources,
+  devices and displays without the requirements, and `LoadOptions.composesDolbyVisionEnhancementLayer
+  = false` keep the single-layer conversion; any composition failure presents the base picture, which is
+  what the conversion showed. The software host keeps its usual costs (picture on the device only, no
+  Atmos passthrough), which is why the option exists.
+
 ### Fixed
 
 - **The surround-downmix warning no longer fires on 5.1 inside a Dolby MAT carrier.** After an APAC

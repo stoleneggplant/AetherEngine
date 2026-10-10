@@ -199,6 +199,36 @@ public enum DolbyVisionRecordAudit {
         walking demuxer: Demuxer, packetBudget: Int = auditPacketBudget,
         byteBudget: Int64 = Int64(walkByteBudget)
     ) -> Int? {
+        firstAnswer(walking: demuxer, packetBudget: packetBudget, byteBudget: byteBudget) { packet, framing in
+            rpuProfile(packet, framing: framing)
+        }
+    }
+
+    /// The enhancement-layer type ("FEL" / "MEL") the first RPU of a Profile 7 source names, from a
+    /// second open, or nil when it cannot be read. What decides whether a session composes the
+    /// enhancement layer (`DolbyVisionFELPolicy`): a MEL's residual is zero, so only a FEL is worth the
+    /// second decoder. Paid only by a Profile 7 the policy would otherwise compose.
+    static func enhancementLayerTypeOfSource(url: URL, extraHeaders: [String: String]) -> String? {
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        do {
+            try demuxer.open(
+                url: url, extraHeaders: extraHeaders,
+                profile: .dolbyVisionRecordAuditDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+        } catch {
+            return nil
+        }
+        return firstAnswer(walking: demuxer, packetBudget: auditPacketBudget,
+                           byteBudget: Int64(walkByteBudget)) { packet, framing in
+            DoviRpuConverter.enhancementLayerType(packet, framing: framing)
+        }
+    }
+
+    /// The bounded walk both audits share: the first video packet `read` has an answer for.
+    private static func firstAnswer<T>(
+        walking demuxer: Demuxer, packetBudget: Int, byteBudget: Int64,
+        _ read: (UnsafePointer<AVPacket>, VideoNALFraming) -> T?
+    ) -> T? {
         let videoIdx = demuxer.videoStreamIndex
         guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else { return nil }
         let codecpar = stream.pointee.codecpar
@@ -226,7 +256,7 @@ public enum DolbyVisionRecordAudit {
             bytesRead += Int(max(packet.pointee.size, 0))
             guard packet.pointee.stream_index == videoIdx else { continue }
             walked += 1
-            if let profile = rpuProfile(packet, framing: framing) { return profile }
+            if let answer = read(UnsafePointer(packet), framing) { return answer }
         }
         return nil
     }
