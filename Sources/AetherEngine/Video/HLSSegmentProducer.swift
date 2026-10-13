@@ -42,6 +42,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// Per-packet RPU conversion P7 -> 8.1 (HEVC P7 on DV panel). The container dvcC is a separate
         /// decision (`doviConfig`); this one rewrites the bitstream.
         let convertP7ToProfile81: Bool
+        /// HDR10+ -> Dolby Vision Profile 8.1 (`LoadOptions.convertsHDR10PlusToDolbyVision`): one RPU per
+        /// picture from its HDR10+, appended by `HDR10PlusDolbyVisionInjector`. nil when not converting.
+        let hdr10PlusDolbyVision: HDR10PlusDolbyVisionMapping.Conversion?
         /// Optional color-signaling override forwarded to `MP4SegmentMuxer.ColorOverride`.
         let colorOverride: MP4SegmentMuxer.ColorOverride?
         /// Optional replacement for `codecpar.extradata` before write_header.
@@ -63,6 +66,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecTagOverride: String?,
             doviConfig: MP4SegmentMuxer.DoviConfigPolicy = .keep,
             convertP7ToProfile81: Bool = false,
+            hdr10PlusDolbyVision: HDR10PlusDolbyVisionMapping.Conversion? = nil,
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
             nalFramingOverride: VideoNALFraming? = nil,
@@ -74,6 +78,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.codecTagOverride = codecTagOverride
             self.doviConfig = doviConfig
             self.convertP7ToProfile81 = convertP7ToProfile81
+            self.hdr10PlusDolbyVision = hdr10PlusDolbyVision
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
             self.nalFramingOverride = nalFramingOverride
@@ -498,6 +503,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedEnhancementLayerType = false
     /// Latched false at SSAI program switch (ad creatives are H.264; mirrors muxer's isReinit ? false : videoConfig.convertP7ToProfile81).
     private var convertP7Active: Bool = false
+    /// Present while this producer converts HDR10+ to Dolby Vision; dropped at an SSAI program switch (an
+    /// ad creative is not the source) and re-armed when the program's own video comes back.
+    private var hdr10PlusDolbyVisionInjector: HDR10PlusDolbyVisionInjector?
+    private var loggedHDR10PlusDolbyVision = false
+    /// The program's own video stream, so a return from an SSAI creative can be told from a switch to one.
+    private let programVideoStreamIndex: Int32
     private var loggedFirstDtsBump = false
     private var loggedFirstDtsDrop = false
     private var loggedFirstAudioDtsBump = false
@@ -1537,6 +1548,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecIsH264: a53CodecKind == .h264,
             framingIsAnnexB: a53NALFraming == .annexB)
         self.convertP7Active = video.convertP7ToProfile81
+        self.programVideoStreamIndex = videoStreamIndex
+        self.hdr10PlusDolbyVisionInjector = Self.makeHDR10PlusDolbyVisionInjector(video)
         self.audioConfig = audio
         self.cache = cache
         self.baseIndex = baseIndex
@@ -3368,6 +3381,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     pendingAdVideoConfig = adConfig
                     activeMuxerVideoExtradata = adConfig.extradata  // #133 follow-up: rebaseline for same-PID PS-change detection
                     convertP7Active = false  // ad creatives are H.264
+                    hdr10PlusDolbyVisionInjector = pktStreamIdx == programVideoStreamIndex
+                        ? Self.makeHDR10PlusDolbyVisionInjector(videoConfig) : nil
                     if lastLiveSegmentFinalizeAt != nil { stampLiveSegmentFinalize() }
                     // pendingDiscontinuityFlag / pendingForceCutFlag set by the rebase below.
                 }
@@ -4256,6 +4271,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             }
                         }
                     }
+                    if let injector = hdr10PlusDolbyVisionInjector {
+                        // Ahead of the cutter and the muxer, so the RPU is in the sample the segment carries.
+                        let outcome = injector.process(packet, framing: a53NALFraming)
+                        if !loggedHDR10PlusDolbyVision {
+                            loggedHDR10PlusDolbyVision = true
+                            let what: String
+                            switch outcome {
+                            case .injected:
+                                what = "Profile 8.1 RPU appended per picture, derived from its HDR10+"
+                            case .alreadyDolbyVision:
+                                what = "the source already carries RPUs; left as they are"
+                            case .noRPU:
+                                what = "no RPU for the first picture (libdovi refused the configuration or the "
+                                    + "packet holds no picture); see the generator's error if it repeats"
+                            case .unsupportedFraming:
+                                what = "none: the video packets use a length prefix other than 4 bytes"
+                            }
+                            EngineLog.emit("[HLSSegmentProducer] HDR10+ -> Dolby Vision: \(what)", category: .session)
+                        }
+                    }
                     // Live: keyframe cutter uses shifted pts. VOD: unused; routing uses prev.dts at look-behind site.
                     let isVideoKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
                     // #731: a bridge that encodes on its own queue hands packets back a feed or more
@@ -4646,6 +4681,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         sourceVideoTbSeconds > 0
             ? Int64(Self.discontinuityThresholdSeconds / sourceVideoTbSeconds)
             : Int64.max
+    }
+
+    /// The HDR10+ -> Dolby Vision rewrite this producer's video config asks for, nil when it asks for none.
+    private static func makeHDR10PlusDolbyVisionInjector(_ video: StreamConfig) -> HDR10PlusDolbyVisionInjector? {
+        guard let conversion = video.hdr10PlusDolbyVision else { return nil }
+        return HDR10PlusDolbyVisionInjector(generator: DolbyVisionRPUGenerator(
+            level6: conversion.level6, primaryIndex: conversion.primaryIndex))
     }
 
     private func finalizeAndWriteVideo(

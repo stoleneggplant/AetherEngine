@@ -10,6 +10,20 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **HDR10+ to Dolby Vision for displays with Dolby Vision (`LoadOptions.convertsHDR10PlusToDolbyVision`).** A
+  Dolby Vision TV without HDR10+ (LG, Sony, most projectors) used to get an HDR10+ title as plain HDR10 with
+  one static grade. With this option such a display gets Dolby Vision Profile 8.1: the HDR10 base layer and
+  its HDR10+ unchanged, a Profile 8.1 configuration record (level from size and rate, FFmpeg's table), and
+  one RPU per picture generated from that picture's HDR10+ by libdovi's own generator, the mapping
+  `dovi_tool generate --hdr10plus-json` uses (L1 from the HDR10+ peak and average, L6 from the base layer's
+  static metadata, L9 from its mastering primaries). The HDR10+ is proven from the source's first video
+  packets before the display is asked for Dolby Vision. Off-device, its L1 matches dovi_tool's output on
+  every picture of hdr10plus_tool's HDR10+ test stream. `dolbyVisionConversion` reads
+  `.hdr10PlusToProfile81`; `aetherctl` takes `--hdr10plus-dv`. See
+  [formats.md](docs/formats.md#hdr10-to-dolby-vision).
+
 ### Fixed
 
 - **The surround-downmix warning no longer fires on 5.1 inside a Dolby MAT carrier.** After an APAC

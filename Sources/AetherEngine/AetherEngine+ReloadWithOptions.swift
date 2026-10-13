@@ -276,6 +276,7 @@ enum SessionOptionCorrection {
         "sequentialOrigin",
         "heldSourceConnection",
         "sharedOutputRole",
+        "convertsHDR10PlusToDolbyVision",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -314,6 +315,11 @@ enum SessionOptionCorrection {
         // accepted and then not happen until something else reopened the source.
         if proposed.heldSourceConnection != current.heldSourceConnection {
             refused.append("heldSourceConnection")
+        }
+        // HDR10+ -> Dolby Vision decides what the display was asked for at load (Dolby Vision instead of
+        // HDR10), and an in-place rebuild runs no criteria handshake, so the next load takes the change.
+        if proposed.convertsHDR10PlusToDolbyVision != current.convertsHDR10PlusToDolbyVision {
+            refused.append("convertsHDR10PlusToDolbyVision")
         }
         return refused
     }
@@ -390,7 +396,8 @@ enum SessionOptionCorrection {
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling",
+        "convertsHDR10PlusToDolbyVision", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",

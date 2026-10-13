@@ -56,6 +56,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// (`VideoRoutingPolicy.presentsDolbyVisionBaseLayer`), ahead of every DV branch including AE#455.
     let dolbyVisionHandling: DolbyVisionHandling
 
+    /// From `LoadOptions.convertsHDR10PlusToDolbyVision`, already resolved by the caller (the display presents
+    /// Dolby Vision, the source carries HDR10+); default false. Acted on in `prepare` for an HEVC PQ source
+    /// with no Dolby Vision record of its own (`hdr10PlusDolbyVisionParameters`).
+    let convertsHDR10PlusToDolbyVision: Bool
+
     /// AE#532: the profile this source's own RPU reports, when the container record was worth doubting
     /// (`DolbyVisionRecordAudit`). nil when nothing was read, which is every source but a Profile 5
     /// record over a BT.2020 YCbCr HDR VUI. The route believes it over the record.
@@ -689,6 +694,77 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Deep copy of AVCodecParameters decoupled from the demuxer's lifetime. Raw pointers into
     /// AVStreams become use-after-free on live reopen (avformat_close_input frees them while the
     /// continuation producer still reads via saved configs). Freed after pump unwinds.
+    /// The Profile 8.1 description of an HDR10+ source this session converts to Dolby Vision: a copy of its
+    /// parameters with a Dolby Vision configuration record (profile 8, compatibility 1, the level its size
+    /// and rate call for, RPU and base layer present), and the static half of every RPU (Level 6 from its
+    /// mastering display and MaxCLL / MaxFALL, Level 9 from its mastering primaries). nil when the session
+    /// does not convert: the option off, a display without Dolby Vision, or a source that is not HEVC PQ or
+    /// already carries a Dolby Vision record.
+    func hdr10PlusDolbyVisionParameters(
+        _ source: UnsafeMutablePointer<AVCodecParameters>, stream: UnsafeMutablePointer<AVStream>
+    ) -> (parameters: OwnedCodecParameters, conversion: HDR10PlusDolbyVisionMapping.Conversion)? {
+        guard convertsHDR10PlusToDolbyVision, dvModeAvailable,
+              source.pointee.codec_id == AV_CODEC_ID_HEVC,
+              source.pointee.color_trc == AVCOL_TRC_SMPTE2084,
+              av_packet_side_data_get(source.pointee.coded_side_data, source.pointee.nb_coded_side_data,
+                                      AV_PKT_DATA_DOVI_CONF) == nil,
+              let copy = OwnedCodecParameters(copying: source) else { return nil }
+        let level = HDR10PlusDolbyVisionMapping.dolbyVisionLevel(
+            width: Int(source.pointee.width), height: Int(source.pointee.height),
+            framesPerSecond: AetherEngine.detectFrameRate(stream: stream))
+        let size = MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
+        guard let item = av_packet_side_data_new(
+            &copy.ptr.pointee.coded_side_data, &copy.ptr.pointee.nb_coded_side_data,
+            AV_PKT_DATA_DOVI_CONF, size, 0) else { return nil }
+        memset(item.pointee.data, 0, size)
+        item.pointee.data.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { record in
+            record.pointee.dv_version_major = 1
+            record.pointee.dv_version_minor = 0
+            record.pointee.dv_profile = 8
+            record.pointee.dv_level = UInt8(level)
+            record.pointee.rpu_present_flag = 1
+            record.pointee.el_present_flag = 0
+            record.pointee.bl_present_flag = 1
+            record.pointee.dv_bl_signal_compatibility_id = 1
+        }
+
+        var level6 = HDR10PlusDolbyVisionMapping.Level6.generatorDefault
+        var primaries: [Double]?
+        func double(_ r: AVRational) -> Double { r.den != 0 ? Double(r.num) / Double(r.den) : 0 }
+        if let mdcv = av_packet_side_data_get(source.pointee.coded_side_data, source.pointee.nb_coded_side_data,
+                                              AV_PKT_DATA_MASTERING_DISPLAY_METADATA),
+           let raw = mdcv.pointee.data, mdcv.pointee.size >= MemoryLayout<AVMasteringDisplayMetadata>.size {
+            raw.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
+                if m.pointee.has_luminance != 0, double(m.pointee.max_luminance) > 0 {
+                    level6.maxMasteringLuminance = Int(double(m.pointee.max_luminance).rounded())
+                    level6.minMasteringLuminance = Int((double(m.pointee.min_luminance) * 10000).rounded())
+                }
+                if m.pointee.has_primaries != 0 {
+                    let p = m.pointee.display_primaries
+                    primaries = [double(p.0.0), double(p.0.1), double(p.1.0), double(p.1.1),
+                                 double(p.2.0), double(p.2.1),
+                                 double(m.pointee.white_point.0), double(m.pointee.white_point.1)]
+                }
+            }
+        }
+        if let clli = av_packet_side_data_get(source.pointee.coded_side_data, source.pointee.nb_coded_side_data,
+                                              AV_PKT_DATA_CONTENT_LIGHT_LEVEL),
+           let raw = clli.pointee.data, clli.pointee.size >= MemoryLayout<AVContentLightMetadata>.size {
+            raw.withMemoryRebound(to: AVContentLightMetadata.self, capacity: 1) { c in
+                level6.maxCLL = Int(c.pointee.MaxCLL)
+                level6.maxFALL = Int(c.pointee.MaxFALL)
+            }
+        }
+        let primaryIndex = primaries.flatMap { HDR10PlusDolbyVisionMapping.primaryIndex($0) }
+        EngineLog.emit(
+            "[HLSVideoEngine] HDR10+ -> Dolby Vision Profile 8.1 level \(level): RPU per picture from its HDR10+ "
+            + "(dovi_tool's mapping, libdovi's generator); L6 mastering \(level6.maxMasteringLuminance) nits, "
+            + "MaxCLL \(level6.maxCLL), MaxFALL \(level6.maxFALL); L9 primaries "
+            + (primaryIndex.map { "index \($0)" } ?? "generator default"),
+            category: .session)
+        return (copy, HDR10PlusDolbyVisionMapping.Conversion(level6: level6, primaryIndex: primaryIndex))
+    }
+
     final class OwnedCodecParameters: @unchecked Sendable {
         let ptr: UnsafeMutablePointer<AVCodecParameters>
 
@@ -972,6 +1048,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        convertsHDR10PlusToDolbyVision: Bool = false,
         dolbyVisionRPUProfile: Int? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
@@ -1024,6 +1101,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.convertsHDR10PlusToDolbyVision = convertsHDR10PlusToDolbyVision
         self.dolbyVisionRPUProfile = dolbyVisionRPUProfile
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
@@ -1240,7 +1318,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard videoIndex >= 0, let videoStream = dem.stream(at: videoIndex) else {
             throw HLSVideoEngineError.noVideoStream
         }
-        let codecpar = videoStream.pointee.codecpar!
+        let sourceCodecpar = videoStream.pointee.codecpar!
+        // HDR10+ -> Dolby Vision: from here on the stream is described as the Profile 8.1 it is served as, so
+        // the codec route, the muxer's `dvvC` and the manifest all read one record. The source's own
+        // parameters are left as they were.
+        let hdr10PlusDolbyVision = hdr10PlusDolbyVisionParameters(sourceCodecpar, stream: videoStream)
+        if let hdr10PlusDolbyVision { ownedCodecParams.append(hdr10PlusDolbyVision.parameters) }
+        let codecpar = hdr10PlusDolbyVision?.parameters.ptr ?? sourceCodecpar
         let isHEVC = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
         let isH264 = codecpar.pointee.codec_id == AV_CODEC_ID_H264
         let isAV1 = codecpar.pointee.codec_id == AV_CODEC_ID_AV1
@@ -1661,6 +1745,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             codecTagOverride: codecTagOverride,
             doviConfig: doviConfig,
             convertP7ToProfile81: convertP7ToProfile81,
+            hdr10PlusDolbyVision: hdr10PlusDolbyVision?.conversion,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
             nalFramingOverride: measuredVideoNALFraming,
@@ -2209,7 +2294,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
         self.servedSourceIsHDR = videoRange != .sdr
-        self.servedDolbyVisionConversion = convertP7ToProfile81 ? .profile7ToProfile81 : nil
+        self.servedDolbyVisionConversion = convertP7ToProfile81
+            ? .profile7ToProfile81
+            : (hdr10PlusDolbyVision != nil ? .hdr10PlusToProfile81 : nil)
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant) audioLang=\(servedAudioLanguage ?? "none"))")
         return url
     }
@@ -2764,6 +2851,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             },
             cleanup: { custom?.reader.close() },
             convertP7ToProfile81: cfg.convertP7ToProfile81,
+            hdr10PlusDolbyVision: cfg.hdr10PlusDolbyVision,
             nalFraming: framing)
         let entries = plan.map {
             IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,

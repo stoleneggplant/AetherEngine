@@ -449,6 +449,24 @@ public struct LoadOptions: Sendable, Equatable {
     /// contradicts.
     public var dolbyVisionHandling: DolbyVisionHandling
 
+    /// Convert HDR10+ to Dolby Vision for a display that presents Dolby Vision. Default `false`.
+    ///
+    /// A Dolby Vision TV without HDR10+ (LG and Sony panels, most projectors) otherwise receives an HDR10+
+    /// title as plain HDR10 and one static grade for the whole film. With this set, an HEVC PQ source that
+    /// carries HDR10+ and no Dolby Vision of its own is served as Dolby Vision Profile 8.1 on such a display:
+    /// the HDR10 base layer unchanged (its HDR10+ included), a Profile 8.1 configuration record, and one RPU per
+    /// picture generated from that picture's HDR10+, the way `dovi_tool generate --hdr10plus-json` does it
+    /// (`HDR10PlusDolbyVisionMapping` documents the mapping). `dolbyVisionConversion` reads
+    /// `.hdr10PlusToProfile81` and `videoFormat` `.dolbyVision`.
+    ///
+    /// Whether the source carries HDR10+ is read from its first video packets before the display is asked
+    /// for Dolby Vision (`.url` VOD sources; a session already proven HDR10+ keeps it across a rebuild). A
+    /// display without Dolby Vision, a source without HDR10+, a live or custom-reader source, and a session
+    /// the host routes to the software path keep their route. A load identity field: it decides what the
+    /// display is asked for at load, which an in-place rebuild does not ask again, so
+    /// `reloadAtCurrentPosition(applying:)` refuses to change it and the next load takes it.
+    public var convertsHDR10PlusToDolbyVision: Bool
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -930,6 +948,7 @@ public struct LoadOptions: Sendable, Equatable {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        convertsHDR10PlusToDolbyVision: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -980,6 +999,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.convertsHDR10PlusToDolbyVision = convertsHDR10PlusToDolbyVision
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
@@ -1041,6 +1061,10 @@ public enum DolbyVisionConversion: Sendable, Equatable {
     /// without Dolby Vision gets the RPU-driven tone map a Profile 8.1 gets). The enhancement layer is
     /// discarded: a MEL carries next to nothing, a FEL loses its refinement.
     case profile7ToProfile81
+    /// An HDR10 source with HDR10+ served as Dolby Vision Profile 8.1 on a display that presents Dolby
+    /// Vision (`LoadOptions.convertsHDR10PlusToDolbyVision`): one RPU per picture, generated from its HDR10+.
+    /// The base layer and its HDR10+ are unchanged; `sourceVideoFormat` keeps saying what the file carries.
+    case hdr10PlusToProfile81
 }
 
 /// One-shot container + stream metadata from `AetherEngine.probe(url:options:)`. No HLS server, no decoders.

@@ -67,11 +67,11 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
-      aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--hdr10plus-dv] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
+      aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] [--hdr10plus-dv] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
-                 [--assert-dv] [--dv-base-layer]
+                 [--assert-dv] [--dv-base-layer] [--hdr10plus-dv]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
@@ -103,7 +103,7 @@ func printUsage() {
                       --sequential-origin declares a fake-range origin (one unranged
                       GET, no ranged probes) and needs --declared-duration on VOD
                       since the tail estimate is skipped)
-      aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dv-base-layer] [--dump <dir>] <url>
+      aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dv-base-layer] [--hdr10plus-dv] [--dump <dir>] <url>
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest [--out PATH.hevc] <file>
@@ -159,6 +159,15 @@ func printUsage() {
                      record over a BT.2020 YCbCr VUI (a relabelled P7 /
                      P8 remux); a genuine P5 has no base layer and keeps
                      its route. Also accepted by `play`.
+      --hdr10plus-dv LoadOptions.convertsHDR10PlusToDolbyVision: on a
+                     display with Dolby Vision, serve an HEVC PQ source
+                     carrying HDR10+ as Dolby Vision Profile 8.1, one
+                     RPU per picture generated from its HDR10+ (libdovi,
+                     dovi_tool's mapping). serve / validate / segverify
+                     build the engine directly and convert whatever the
+                     source carries (no HDR10+ falls back to its static
+                     metadata); `play` goes through the load, which first
+                     proves the HDR10+. Also accepted by `segverify`.
 
     Flags (play only):
       --assert-dv    AE#493: set LoadOptions.panelPresentsDolbyVision,
@@ -344,6 +353,7 @@ if first == "segverify" {
     let noDV    = takeFlag("--no-dv", from: &rest)
     let forceDV = takeFlag("--force-dv", from: &rest)
     let dvBaseLayer = takeFlag("--dv-base-layer", from: &rest)
+    let hdr10PlusDV = takeFlag("--hdr10plus-dv", from: &rest)
     let dumpDir = takeStringFlag("--dump", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: segverify requires a <url> argument")
@@ -354,6 +364,7 @@ if first == "segverify" {
     exit(runSegVerify(url: parseSourceURL(urlArg), from: fromIdx, count: count, dvModeAvailable: !noDV,
                       forceDVWithoutDisplay: forceDV,
                       dolbyVisionHandling: dvBaseLayer ? .baseLayerOnly : .automatic,
+                      convertsHDR10PlusToDolbyVision: hdr10PlusDV,
                       dumpDir: dumpDir))
 }
 
@@ -650,6 +661,8 @@ if first == "play" {
     // `LoadOptions.dolbyVisionHandling = .baseLayerOnly`: the base layer of a Dolby Vision source, the
     // Dolby Vision left out of the container. The harness for a record the bitstream contradicts.
     let playDVHandling: DolbyVisionHandling = takeFlag("--dv-base-layer", from: &rest) ? .baseLayerOnly : .automatic
+    // `LoadOptions.convertsHDR10PlusToDolbyVision`: an HDR10+ source as Dolby Vision on a DV display.
+    let playHDR10PlusDV = takeFlag("--hdr10plus-dv", from: &rest)
     // AE#560: record the live source to a file from the session's existing connection.
     let playRecord = takeStringFlag("--record", from: &rest).map { URL(fileURLWithPath: $0) }
     // AE#492: `LoadOptions.deinterlaceFieldRate`. `send_field` (the default) emits one frame per
@@ -902,6 +915,7 @@ if first == "play" {
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
                  dolbyVisionHandling: playDVHandling,
+                 convertsHDR10PlusToDolbyVision: playHDR10PlusDV,
                  record: playRecord))
 }
 
@@ -912,6 +926,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let forceDV = takeFlag("--force-dv", from: &rest)
     // The base layer of a Dolby Vision source, the Dolby Vision left out of the container.
     let dvHandling: DolbyVisionHandling = takeFlag("--dv-base-layer", from: &rest) ? .baseLayerOnly : .automatic
+    let hdr10PlusDV = takeFlag("--hdr10plus-dv", from: &rest)
     let framesOverride = takeIntFlag("--frames", from: &rest)
     let atSeconds = takeDoubleFlag("--at", from: &rest) ?? 60.0
     let extractLoops = takeIntFlag("--loops", from: &rest) ?? 1
@@ -1025,7 +1040,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         exit(runProbe(url: url, detecting: probeDetail))
     case "serve":
         runServe(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
-                 dolbyVisionHandling: dvHandling,
+                 dolbyVisionHandling: dvHandling, convertsHDR10PlusToDolbyVision: hdr10PlusDV,
                  nativeSubsIndex: nativeSubsIndex, startPosition: startPosition,
                  audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
                  objectAudioRendering: serveObjectAudioRendering,
@@ -1033,7 +1048,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                  audioStreamIndex: customAudioIndex)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
-                         dolbyVisionHandling: dvHandling))
+                         dolbyVisionHandling: dvHandling, convertsHDR10PlusToDolbyVision: hdr10PlusDV))
     case "swdecode":
         exit(runSWDecode(url: url, maxPackets: framesOverride ?? 100))
     case "extract":

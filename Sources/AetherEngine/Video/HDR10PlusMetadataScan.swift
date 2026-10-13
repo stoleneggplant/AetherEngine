@@ -260,6 +260,59 @@ enum HDR10PlusMetadataScan {
         return body[bodySize - 1] & UInt8((1 << padding) - 1) == 0
     }
 
+    /// One picture's HDR10+ values for the Dolby Vision conversion (`HDR10PlusDolbyVisionInjector`): its
+    /// in-band ST 2094-40 SEI, else its packet side data, each validated as the scan validates them. nil when
+    /// the packet carries neither.
+    static func frameStats(
+        _ packet: UnsafePointer<AVPacket>, codecID: AVCodecID, framing: VideoNALFraming
+    ) -> HDR10PlusDolbyVisionMapping.FrameStats? {
+        if let data = packet.pointee.data, packet.pointee.size > 0,
+           codecID == AV_CODEC_ID_HEVC || codecID == AV_CODEC_ID_H264,
+           mayContainT35Header(data, size: Int(packet.pointee.size)) {
+            var stats: HDR10PlusDolbyVisionMapping.FrameStats?
+            _ = scanNALs(UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)),
+                         codecID: codecID, framing: framing) { bytes, count in
+                guard stats == nil, validT35(bytes, count),
+                      let metadata = av_dynamic_hdr_plus_alloc(nil) else { return false }
+                defer { av_free(metadata) }
+                guard av_dynamic_hdr_plus_from_t35(
+                    metadata, bytes + t35Header.count, count - t35Header.count) >= 0 else { return false }
+                stats = frameStats(metadata.pointee)
+                return stats != nil
+            }
+            if let stats { return stats }
+        }
+        var size = 0
+        guard let sideData = av_packet_get_side_data(packet, AV_PKT_DATA_DYNAMIC_HDR10_PLUS, &size),
+              validSideData(sideData, size: size) else { return nil }
+        var allocationSize = 0
+        guard let metadata = av_dynamic_hdr_plus_alloc(&allocationSize), allocationSize == size else { return nil }
+        defer { av_free(metadata) }
+        memcpy(metadata, sideData, size)
+        return frameStats(metadata.pointee)
+    }
+
+    /// The first window's values in ST 2094-40's integer units (0.1 cd/m2): FFmpeg holds each as a rational
+    /// over 100000 of 10000 cd/m2.
+    static func frameStats(_ metadata: AVDynamicHDRPlus) -> HDR10PlusDolbyVisionMapping.FrameStats? {
+        guard metadata.num_windows >= 1 else { return nil }
+        let window = withUnsafeBytes(of: metadata.params) {
+            $0.bindMemory(to: AVHDRPlusColorTransformParams.self)[0]
+        }
+        func raw(_ r: AVRational) -> UInt32 {
+            guard r.den > 0, r.num >= 0 else { return 0 }
+            return UInt32(min((Double(r.num) * 100_000 / Double(r.den)).rounded(), 100_000))
+        }
+        let count = min(Int(window.num_distribution_maxrgb_percentiles), 15)
+        let distribution = withUnsafeBytes(of: window.distribution_maxrgb) {
+            $0.bindMemory(to: AVHDRPlusPercentile.self).prefix(count).map { raw($0.percentile) }
+        }
+        return HDR10PlusDolbyVisionMapping.FrameStats(
+            maxSCL: [raw(window.maxscl.0), raw(window.maxscl.1), raw(window.maxscl.2)],
+            averageMaxRGB: raw(window.average_maxrgb),
+            distribution: distribution)
+    }
+
     private static func validSideData(_ bytes: UnsafePointer<UInt8>, size: Int) -> Bool {
         var allocationSize = 0
         guard let metadata = av_dynamic_hdr_plus_alloc(&allocationSize) else { return false }
