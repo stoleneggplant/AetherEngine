@@ -92,6 +92,30 @@ final class OriginRequestBudget: @unchecked Sendable {
         let granted: Bool
     }
 
+    /// A finite request ends on the delegate queue, before its synchronous caller resumes.
+    /// Cancellation/early return may race that callback, so the ticket is returned only once.
+    final class Lease: @unchecked Sendable {
+        private let lock = NSLock()
+        private let budget: OriginRequestBudget
+        private var ticket: Ticket?
+
+        init(_ ticket: Ticket?, budget: OriginRequestBudget = .shared) {
+            self.ticket = ticket
+            self.budget = budget
+        }
+
+        deinit { release() }
+
+        func release() {
+            let held = lock.withLock {
+                let held = ticket
+                ticket = nil
+                return held
+            }
+            budget.release(held)
+        }
+    }
+
     struct Snapshot {
         var inflight: Int
         var peakInflight: Int

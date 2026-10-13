@@ -9,6 +9,27 @@ import Testing
 @Suite("PlaybackErrorInfo (#376)")
 struct PlaybackErrorInfoTests {
 
+    @MainActor
+    @Test("A failed custom probe publishes its cause before the host observes the terminal state")
+    func customProbeRetainsCause() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        var observed: PlaybackErrorInfo?
+        let token = engine.$state.sink { state in
+            if case .error = state { observed = engine.errorInfo }
+        }
+        defer { token.cancel() }
+        do {
+            _ = try await engine.load(source: .custom(DataIOReader(data: Data()), formatHint: "mpegts"))
+            Issue.record("An empty custom source must fail its probe")
+        } catch {
+            #expect(observed?.kind == .customSourceProbeFailed)
+            #expect(observed?.underlyingDomain == "AetherEngine.DemuxerError")
+            #expect(observed?.underlyingCode != nil)
+            #expect(observed == engine.errorInfo)
+        }
+    }
+
     @Test("An underlying NSError contributes its domain and code")
     func capturesUnderlying() {
         let underlying = NSError(domain: "CoreMediaErrorDomain", code: -12939)

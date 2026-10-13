@@ -35,6 +35,105 @@ the public-API contract.
 
 ### Fixed
 
+- **A live GOP longer than the sealed target duration no longer breaks the playlist.** RFC 8216 keeps
+  `TARGETDURATION` fixed for a playlist's life, so a later segment above it made the playlist invalid
+  for AVPlayer (-12642). The engine now retires that playlist URL with its original target and an
+  end index before the long segment, and serves the same cache under a new `live-N/` namespace with
+  a fresh seal; the consumer item swaps to it in place, keeping source, cache, position (also behind
+  live) and play/pause intent. A media playlist failure no longer counts as evidence against the HDR
+  master (#748, thanks @yucelokan).
+
+## [7.36.0] - 2026-10-13
+
+### Added
+
+- **DTS:X keeps its heights too.** Apple TV cannot bitstream DTS-HD either, so the bridge decoded a
+  DTS:X track's compatible 7.1, where the encoder had folded its four heights (and any objects) into
+  the floor channels. `LoadOptions.objectAudioRendering = .apac(layout)` now sends DTS-HD Master Audio
+  through the new [LibDTSX](https://github.com/superuser404notfound/LibDTSX) dependency (the `dca` crate behind
+  a C API, packaged like LibTrueHD), which removes those folds and returns the bed, the fixed heights
+  and the objects of the alternate presentations with their positions in LibTrueHD's room
+  coordinates; the same renderer, limiter and APAC encoder then deliver it. FFmpeg names only two of
+  DTS:X's markers and labels some DTS:X plain "DTS-HD MA", so every 48 kHz DTS-HD MA track is offered:
+  LibDTSX decides on the track's first three frames, which the engine reads through the demuxer's
+  peek where the first producer starts (on a resume too, so no head read is thrown away), capped at
+  512 packets or 24 MiB, so a refusal costs no I/O and keeps `audioBridgeMode` (*Arrival*, plain
+  DTS-HD MA, was refused on its first frame). Rendered into 7.1.4, *8 Mile*, *The Bourne
+  Identity* and the DTS:X Object Emulator demo (bed plus four heights) put every channel on its own
+  speaker, bit for bit what SpatialAudioBridge's DTS:X renderer gives. *Independence Day* (FFmpeg:
+  "DTS:X IMAX") carries two static objects in front, and a D4 trailer five moving ones; their
+  sound points where SpatialAudioBridge puts it within 0.4° and 2.3° (90th percentile of 200 ms
+  windows), the floor channels identical but for rounding and the ceiling within 0.2 points of its
+  share (measured before #742 moved the top speakers in from the corners). The first two DTS-HD
+  frames after a start or seek only rebuild the decoder's history, so the audio starts 21 ms later:
+  entered mid-stream, the first frame otherwise decodes distorted. With the option
+  on, the automatic audio pick also prefers a track FFmpeg labels DTS:X within its language. The
+  alternate presentations are experimental in `dca` and here (#744, #755, thanks @kristofferR, and
+  @andreencar for the review that caught a timeline drift after repeated damage, fixed in LibDTSX 1.0.1).
+
+### Changed
+
+- **Below OS 26 the automatic audio pick no longer prefers a TrueHD Atmos track** with
+  `objectAudioRendering` on. There is no APAC encoder there, so the preferred track only ever played
+  as its 7.1 bed; the default track now keeps its place, as with rendering off (#755).
+- **LibTrueHD 2.3.0: the TrueHD object decode takes about a third less time again.** The `truehd`
+  crate is pinned to harletty's speed work (blocks decoded in place, table-driven Huffman codes,
+  prediction filters for several channels side by side, whole-block matrices), which includes
+  truehdd#42 from 2.2.0, with byte-identical output. Unfold through the decoder: 0.98 s to 0.60 s
+  (M1). The APAC encoder stays the slower half of the bridge, so the whole decode-and-encode gains
+  about 10% (6.5x to 7.2x real time in a debug build); the rest is a lighter decode thread (#731).
+
+### Fixed
+
+- **A live source that repeats itself after a reconnect is not played twice (#747, thanks @yucelokan).**
+  Packets a reconnect delivers again are now recognised by exact identity on both tracks and dropped
+  before the muxer, the recording, the software clock and the DVR window see them, and a damaged
+  outgoing picture at that seam is held until the intact copy from the replay replaces it. Before,
+  the partial picture and its replacement were both muxed, and native decoding broke until the next
+  IDR. An ambiguous seam keeps every packet. A verified replay no longer goes straight to the host:
+  the engine reopens the source itself, keeping its cache and history, and only when that runs out
+  does the host hear `liveSourceReset` as before. A host that sets
+  `LoadOptions.hostRetriesExhaustedLiveReplay` gets `liveSourceReplayExhausted` instead and resumes
+  with `retryLiveSourceRecovery()` without losing the DVR window. New opt-in levers, both off by
+  default: `nativeVideoFrameDiagnostics` samples decoded output on SDR native playback, and
+  `nativeVideoFrameRecovery` nudges, then replaces in place, an item whose picture stopped while
+  its clock runs on.
+
+- **A reader waiting for an origin slot gets it when the request ends, not when its owner wakes (#746,
+  thanks @yucelokan).** Finite requests return their slot from the completion callback, after the
+  refusal (if any) is on the books, and the AVIO, held-transport and prewarm sessions deliver on
+  their own user-initiated queues instead of an implicit one that inherits a utility caller. A size
+  probe answered 429 without `Retry-After` now arms the backoff ladder instead of a zero quiet period.
+- **A custom source that fails its probe says why (#745, thanks @yucelokan).** `.customSourceProbeFailed` now carries
+  the probe error's `underlyingDomain` and `underlyingCode` in `errorInfo`, set before the terminal
+  `.error` state, where it used to arrive with nothing but the generic message.
+- **Video comes back after a screen lock on the software path (#739, thanks @ijuniorfu).** On iOS a
+  screen lock invalidates the VideoToolbox session, and the decoder only logged the resulting
+  `kVTInvalidSessionErr` (-12903) and kept feeding the dead session, so the picture never returned. A
+  source without audio raced to EOF in the background, since audio-only mode had nothing to pace it.
+  The lost session is now rebuilt from its stored format description and resumes at the next
+  keyframe, repositioned to the playhead in the foreground and owed to the foreground return in the
+  background. A software session that renders no audio is released like a paused one instead of
+  entering audio-only mode. `aetherctl bgaudio --lose-session` reproduces both cases.
+- **A playlist served without a length plays (#733).** A playlist endpoint answering 200 with no
+  Content-Length (chunked, typical for a dynamic `/api/playlist?id=` handler) goes forward-only at the
+  open, and the `#EXTM3U` check only read the window that path leaves empty, so FFmpeg got the m3u8
+  and the load ended in "Invalid data found when processing input". The same classification now runs
+  on the forward-only stream's first bytes, and the playlist reaches the HLS ingest.
+
+- **A host with its own Objective-C and C++ links again (#752).** Since 7.34.0 LibTrueHD and LibDovi
+  each brought a `rust_eh_personality`, and with the host's `__objc_personality_v0` and
+  `__gxx_personality_v0` that made four personality routines, one more than compact unwind encodes
+  per image, so `ld` refused the app (Syravo with KSCrash, on every platform). LibTrueHD 2.2.1
+  exports its copy weak, so the linker keeps one. A patch, so 7.34.1 and later pick it up on
+  resolve; 7.34.0 pins LibTrueHD 2.1.x and stays affected.
+- **Objects play from the first frame after a seek in TrueHD Atmos rendered to APAC.** Decoding
+  resumes at the next major sync, and the first object metadata follows up to 32 ms later; until it
+  arrived, every object rendered silent, so after each seek the APAC carried the LFE alone (21 to
+  24 ms on Nature's Fury). The decoder now holds those blocks and releases them with the first
+  metadata's state applied from their first frame (`ObjectMetadataHold`), waiting at most 100 ms.
+  A segment cut releases what is still held as it is, so the hold never moves audio into the next
+  segment.
 - **The surround-downmix warning no longer fires on 5.1 inside a Dolby MAT carrier.** After an APAC
   session tvOS keeps the HDMI output in the 2-channel MAT carrier it negotiated, so a 5.1 `ec-3` track
   played next read `output=2` and the log claimed a downmix while the sink played the 5.1 intact (Apple
@@ -82,6 +181,20 @@ the public-API contract.
   carry an enhancement layer nothing decodes, and `forceDolbyVisionOnNonDVDisplay` applies to Profile 7
   too. `dolbyVisionConversion` reads `.profile7ToProfile81` on every such session.
   `dolbyVisionHandling = .baseLayerOnly` is unchanged. Found by dotModded.
+
+- **Ceiling speakers sit where TS 103 448 puts them.** The renderer placed the top speakers in the
+  room's corners, so overhead content near the front leaked backwards and the whole mix sat higher
+  than Apple's own render of the same title. They now sit a quarter of the room in from each wall.
+  Against Apple's render of the matching DD+ Atmos, energy-weighted: Black Hawk Down 3.3° → 0.8°
+  direction error, +3.2° → +0.4° elevation bias, +4.1 → +0.6 points top-share; a single overhead
+  helicopter 6.3° → 0.2°; Dolby's Amaze 4.7° → 3.3°.
+
+- **A 5.1 bed's surrounds sit where TS 103 448 puts them.** The object renderer placed the 5.1.2 and
+  5.1.4 surrounds in the rear corners; table A.3 puts them halfway down the side walls, where a 7.1 bed
+  has its sides. An object on the side wall halfway back now plays from the surround alone instead of
+  half from the front, and one a quarter of the way back puts 50% of its power in the surround
+  instead of 15%. The no-back and no-sides zone masks no longer take a 5.1 layout's surrounds away,
+  which table 4 does not do on a 3/2 floor; screen-only still does. 7.1 and 9.1 layouts are unchanged.
 
 ## [7.35.1] - 2026-10-12
 

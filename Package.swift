@@ -55,7 +55,12 @@ let package = Package(
         // TrueHD decoder that also decodes the Atmos object presentation (beds, objects, OAMD) for
         // `objectAudioRendering` (#731). The Rust `truehd` crate (Apache-2.0) behind a C API, prebuilt
         // as an xcframework like LibDovi so consumers need no Rust. Pinned to the minor for the same reason.
-        .package(url: "https://github.com/superuser404notfound/LibTrueHD", .upToNextMinor(from: "2.2.0")),  // 2.2.0: decodes about 30% faster (the truehd crate with its block and PCM buffers sized to the samples they hold, truehdd#42, from a fork of upstream main until that is merged), byte-identical output; 2.1.0: x86_64 in the iOS simulator slice, so a generic iOS Simulator build of a host links; same decoder; 2.0.0: transferred from Silo-Server/SiloObjectAudio and renamed (product TrueHD), rebuilt from source; same decoder as SiloObjectAudio 1.0.0
+        .package(url: "https://github.com/superuser404notfound/LibTrueHD", .upToNextMinor(from: "2.3.0")),  // 2.3.0: decodes about a third faster again (harletty's truehd speed work: blocks decoded in place, table-driven Huffman, vectorised prediction filters, whole-block matrices; truehdd#42 included), byte-identical output; 2.2.1: rust_eh_personality exported weak, so it coalesces with LibDovi's copy and a host with its own Objective-C and C++ stays within compact unwind's three personality routines (#752); same decoder; 2.2.0: decodes about 30% faster (the truehd crate with its block and PCM buffers sized to the samples they hold, truehdd#42, from a fork of upstream main until that is merged), byte-identical output; 2.1.0: x86_64 in the iOS simulator slice, so a generic iOS Simulator build of a host links; same decoder; 2.0.0: transferred from Silo-Server/SiloObjectAudio and renamed (product TrueHD), rebuilt from source; same decoder as SiloObjectAudio 1.0.0
+        // DTS:X decoder for `objectAudioRendering`: lossless DTS-HD MA with the encoder's height and object
+        // folds removed from the bed, the fixed heights, and the alternate presentations' objects placed in
+        // the same room coordinates as LibTrueHD's. The Rust `dca` crate (Apache-2.0) behind a C API,
+        // prebuilt as an xcframework like LibTrueHD. Pinned to the minor for the same reason.
+        .package(url: "https://github.com/superuser404notfound/LibDTSX", .upToNextMinor(from: "1.0.1")),  // 1.0.1: rust_eh_personality weak (#752); dca 0.8.0 (harletty-bridge a717bae); the first two frames after a start or seek only prime the decoder
     ],
     targets: [
         .target(
@@ -64,6 +69,7 @@ let package = Package(
                 .product(name: "AetherFFmpegBuild", package: "FFmpegBuild"),
                 .product(name: "Dovi", package: "LibDovi"),
                 .product(name: "TrueHD", package: "LibTrueHD"),
+                .product(name: "DTSX", package: "LibDTSX"),
             ],
             // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS.
             resources: [.copy("Resources/silent-atmos.mp4")],

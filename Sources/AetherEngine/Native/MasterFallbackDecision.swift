@@ -62,6 +62,19 @@ enum MasterFallbackDecision {
         isDisplayRejectionCode(code) || code == -1002
     }
 
+    /// A malformed media playlist can be wrapped in the same -11848 as a display refusal.
+    /// It says nothing about HDR support and must not poison the process's display decision.
+    static func isMasterRejection(_ error: NSError, mediaErrorCodes: [Int] = []) -> Bool {
+        guard !mediaErrorCodes.contains(-12642) else { return false }
+        var current: NSError? = error
+        for _ in 0..<8 {
+            guard let value = current else { break }
+            if value.domain == "CoreMediaErrorDomain", value.code == -12642 { return false }
+            current = value.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return isMasterRejectionCode(error.code)
+    }
+
     /// Fall back to the media playlist only when a master-rejection failed the item, the engine was
     /// serving the master, and this session has not already fallen back (single-shot, no loop).
     static func shouldFallBackToMediaPlaylist(

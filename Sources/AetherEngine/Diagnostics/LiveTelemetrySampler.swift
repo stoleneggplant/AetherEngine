@@ -64,8 +64,6 @@ struct NativeAVFReadings: Sendable {
     /// the consumer cannot reach without stalling first. A decision that spends this depth needs the
     /// half it can actually walk; nil when no loaded range contains the playhead at all.
     var contiguousForwardBufferSeconds: Double? = nil
-    /// Sum over all access-log events, for the [LagDiag] tick-over-tick drop delta.
-    var droppedFramesLifetimeSum: Int = 0
     /// The current variant's declared BANDWIDTH and AVERAGE-BANDWIDTH, in bits per second, from the
     /// latest access-log entry. The log reports an undeclared value as negative.
     var indicatedBitrate: Double = -1
@@ -132,7 +130,7 @@ final class LiveTelemetrySampler {
 
     /// [LagDiag] tick-over-tick state (#93 post-recovery lag diagnosis).
     private var lagLastClock: Double?
-    private var lagLastDroppedSum: Int = 0
+    private var lagLastDroppedSum: Int?
 
     /// #169 tail-park end-of-media synthesis state.
     private var eomParkFrozenTicks: Int = 0
@@ -164,7 +162,7 @@ final class LiveTelemetrySampler {
         meterLedger = nil
         lastTickTime = nil
         lagLastClock = nil
-        lagLastDroppedSum = 0
+        lagLastDroppedSum = nil
         eomParkFrozenTicks = 0
         eomParkLastPlayhead = nil
         didSynthesizeEomPark = false
@@ -324,7 +322,6 @@ final class LiveTelemetrySampler {
                     readings.networkTransferredBytes, retired: engine.nativeHost?.retiredItemTransferredBytes ?? 0)
                 readings.droppedFrameCount = Self.foldRetired(
                     readings.droppedFrameCount, retired: engine.nativeHost?.retiredItemDroppedFrames ?? 0)
-                readings.droppedFramesLifetimeSum = readings.droppedFrameCount ?? 0
                 nativeReadings = readings
                 droppedFrameCount = readings.droppedFrameCount
                 networkThroughputMbps = readings.networkThroughputMbps
@@ -470,8 +467,8 @@ final class LiveTelemetrySampler {
         let dclk = (clock.isFinite && lagLastClock != nil) ? clock - lagLastClock! : nil
         if clock.isFinite { lagLastClock = clock }
 
-        let droppedSum = readings.droppedFramesLifetimeSum
-        let dDrop = droppedSum - lagLastDroppedSum
+        let droppedSum = readings.droppedFrameCount
+        let dDrop = droppedSum.flatMap { total in lagLastDroppedSum.map { total - $0 } }
         lagLastDroppedSum = droppedSum
 
         let tcs: String
@@ -495,7 +492,7 @@ final class LiveTelemetrySampler {
             + "tcs=\(tcs) rate=\(fmt2(Double(readings.rate))) wait=\(readings.reasonForWaitingToPlay ?? "-") "
             + "fwd=\(readings.forwardBufferSeconds.map { String(format: "%.1f", $0) } ?? "-") "
             + "keepUp=\(readings.isPlaybackLikelyToKeepUp ? "y" : "n") empty=\(readings.isPlaybackBufferEmpty ? "y" : "n") "
-            + "drop=\(droppedSum)+\(dDrop) stall=\(engine.nativeHost?.stallCount ?? 0) "
+            + "drop=\(droppedSum.map(String.init) ?? "-")+\(dDrop.map(String.init) ?? "-") videoFrames=unavailable stall=\(engine.nativeHost?.stallCount ?? 0) "
             + "ready=\((engine.nativeHost?.playerLayer.isReadyForDisplay ?? false) ? "y" : "n") "
             + "thermal=\(thermal) net=\(netMbps.map { String(format: "%.1f", $0) } ?? "-") "
             + "restarts=\(engine.producerRestartCount)",
@@ -604,7 +601,6 @@ final class LiveTelemetrySampler {
             readings.networkTransferredBytes = Self.sessionTotal(perEntry: events.map(\.numberOfBytesTransferred))
             readings.droppedFrameCount = Self.sessionTotal(perEntry: events.map(\.numberOfDroppedVideoFrames))
         }
-        readings.droppedFramesLifetimeSum = readings.droppedFrameCount ?? 0
 
         let now = player.currentTime().seconds
         readings.currentTimeSeconds = now
