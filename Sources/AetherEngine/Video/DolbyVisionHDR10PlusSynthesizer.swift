@@ -23,7 +23,11 @@ import Dovi
 /// (`HDR10PlusMetadataScan`) sees the SEI like any other, which flips the published `videoFormat` to
 /// `.hdr10Plus`.
 ///
-/// Not thread-safe: one instance belongs to one producer read loop (or one I-frame read).
+/// `payload(for:framing:)` makes the same decision without rewriting anything, for the dual-layer FEL
+/// decoder, which attaches HDR10+ to the composed picture instead of the bitstream.
+///
+/// Not thread-safe: one instance belongs to one producer read loop, one I-frame read, or one decoder's
+/// feed.
 final class DolbyVisionHDR10PlusSynthesizer {
 
     enum Outcome: Equatable {
@@ -53,6 +57,7 @@ final class DolbyVisionHDR10PlusSynthesizer {
     private var currentLevel1: DolbyVisionHDR10PlusMapping.Level1?
     /// The SEI for `currentLevel1`, rebuilt only when the shot changes.
     private var cachedNAL: (level1: DolbyVisionHDR10PlusMapping.Level1, nal: [UInt8])?
+    private var cachedPayload: (level1: DolbyVisionHDR10PlusMapping.Level1, payload: [UInt8])?
 
     /// `nativeHDR10Plus` is the audit's answer, nil when there was none (a custom reader, a live source).
     init(nativeHDR10Plus: DolbyVisionHDR10PlusAudit.Result.NativeHDR10Plus? = nil,
@@ -177,10 +182,52 @@ final class DolbyVisionHDR10PlusSynthesizer {
         return outcome
     }
 
+    /// The HDR10+ a picture should carry, by the same preference order as `process` (its own in-band SEI,
+    /// its own side data, then derived from the RPU, never mixing derived with native), as a complete T.35
+    /// payload from the country code on, without touching the packet. For a decoder path that attaches
+    /// HDR10+ per frame (`kCMSampleAttachmentKey_HDR10PlusPerFrameData`) rather than in the bitstream: the
+    /// composed Profile 7 FEL picture, whose RPU's L1 describes the composed signal, not the base layer.
+    func payload(
+        for packet: UnsafePointer<AVPacket>, framing: VideoNALFraming
+    ) -> (outcome: Outcome, t35: [UInt8]?) {
+        guard let data = packet.pointee.data, packet.pointee.size > 2 else { return (.noMetadata, nil) }
+        let size = Int(packet.pointee.size)
+        switch framing {
+        case .annexB: break
+        case .lengthPrefixed(let width): guard (1...4).contains(width) else { return (.unsupportedFraming, nil) }
+        }
+        let base = UnsafePointer(data)
+        if let native = HDR10PlusMetadataScan.inBandT35Payload(
+            base, size: size, codecID: AV_CODEC_ID_HEVC, framing: framing) {
+            servesNativeHDR10Plus = true
+            return (.nativeInBand, native)
+        }
+        if let native = HDR10PlusMetadataScan.sideDataT35Payload(packet) {
+            servesNativeHDR10Plus = true
+            return (.nativeFromSideData, native)
+        }
+        guard !servesNativeHDR10Plus else { return (.noMetadata, nil) }
+        var level1: DolbyVisionHDR10PlusMapping.Level1?
+        A53SEIParser.forEachNAL(base, size, framing) { nal, length in
+            guard level1 == nil, length > 2, (nal[0] >> 1) & 0x3F == Self.nalTypeRPU else { return }
+            level1 = Self.level1(ofRPU: nal, length: length)
+        }
+        if let level1 { currentLevel1 = level1 }
+        guard let shot = currentLevel1 else { return (.noMetadata, nil) }
+        derivedCount += 1
+        return (.derived, derivedPayload(for: shot))
+    }
+
+    private func derivedPayload(for shot: DolbyVisionHDR10PlusMapping.Level1) -> [UInt8] {
+        if let cached = cachedPayload, cached.level1 == shot { return cached.payload }
+        let payload = DolbyVisionHDR10PlusMapping.t35Payload(DolbyVisionHDR10PlusMapping.metadata(for: shot))
+        cachedPayload = (shot, payload)
+        return payload
+    }
+
     private func derivedNAL(for shot: DolbyVisionHDR10PlusMapping.Level1) -> [UInt8] {
         if let cached = cachedNAL, cached.level1 == shot { return cached.nal }
-        let nal = DolbyVisionHDR10PlusMapping.hevcPrefixSEINAL(
-            t35Payload: DolbyVisionHDR10PlusMapping.t35Payload(DolbyVisionHDR10PlusMapping.metadata(for: shot)))
+        let nal = DolbyVisionHDR10PlusMapping.hevcPrefixSEINAL(t35Payload: derivedPayload(for: shot))
         cachedNAL = (shot, nal)
         return nal
     }

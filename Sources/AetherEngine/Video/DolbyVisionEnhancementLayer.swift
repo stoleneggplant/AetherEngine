@@ -105,6 +105,12 @@ enum DolbyVisionEnhancementLayer {
 /// hardware HEVC and Dolby Vision decode, and the source is a seekable VOD whose samples are
 /// length-prefixed (the software host feeds VideoToolbox those as they are). `refusal` names the gate
 /// that failed.
+///
+/// A display without Dolby Vision qualifies too when the session converts Dolby Vision to HDR10+
+/// (`convertsToHDR10Plus`, i.e. `LoadOptions.convertsDolbyVisionToHDR10Plus` resolved against this source
+/// and display): the composition then runs first and the composed picture goes out as HDR10+
+/// (`outputsHDR10Plus`, `DolbyVisionFELDecoder.Output.hdr10Plus`), so the enhancement layer's change to
+/// the picture reaches that display as well, with metadata that describes it.
 enum DolbyVisionFELPolicy {
 
     struct Inputs: Equatable, Sendable {
@@ -117,12 +123,21 @@ enum DolbyVisionFELPolicy {
         var sourceIsSeekable: Bool
         var samplesAreLengthPrefixed: Bool
         var hardwareCanCompose: Bool
+        /// The session converts Dolby Vision to HDR10+ on this display (`VideoRoutingPolicy
+        /// .synthesizesHDR10PlusFromDolbyVision`), which is only ever true on a display without it.
+        var convertsToHDR10Plus: Bool = false
+    }
+
+    /// The display the composed picture can be presented to: one with Dolby Vision, or one without it
+    /// when the session converts to HDR10+.
+    private static func displayTakesComposition(_ i: Inputs) -> Bool {
+        i.displayPresentsDolbyVision || i.convertsToHDR10Plus
     }
 
     static func composes(_ i: Inputs) -> Bool {
         i.dvProfile == 7
             && i.enhancementLayerType == "FEL"
-            && i.displayPresentsDolbyVision
+            && displayTakesComposition(i)
             && !i.presentsBaseLayerOnly
             && i.hostAllowsComposition
             && !i.isLive
@@ -138,7 +153,9 @@ enum DolbyVisionFELPolicy {
         if i.dvProfile != 7 { return "not Profile 7" }
         if !i.hostAllowsComposition { return "not requested (preferDualLayerDolbyVision is off)" }
         if i.presentsBaseLayerOnly { return "dolbyVisionHandling is baseLayerOnly" }
-        if !i.displayPresentsDolbyVision { return "the display does not present Dolby Vision" }
+        if !displayTakesComposition(i) {
+            return "the display does not present Dolby Vision (and the session does not convert to HDR10+)"
+        }
         if i.isLive { return "live source" }
         if !i.sourceIsSeekable { return "forward-only source" }
         if !i.samplesAreLengthPrefixed { return "Annex-B samples (MPEG-TS / M2TS)" }
@@ -153,9 +170,14 @@ enum DolbyVisionFELPolicy {
     /// Whether the enhancement layer is worth reading for at all, i.e. whether the load pays for a
     /// second open of the source to learn FEL from MEL. Everything `composes` needs except the RPU's
     /// own answer and the hardware, which is the cheapest to ask last.
+    /// Whether a composing session presents the composed picture as HDR10+ rather than Dolby Vision.
+    static func outputsHDR10Plus(_ i: Inputs) -> Bool {
+        composes(i) && !i.displayPresentsDolbyVision && i.convertsToHDR10Plus
+    }
+
     static func worthAuditing(_ i: Inputs) -> Bool {
         i.dvProfile == 7
-            && i.displayPresentsDolbyVision
+            && displayTakesComposition(i)
             && !i.presentsBaseLayerOnly
             && i.hostAllowsComposition
             && !i.isLive

@@ -330,6 +330,13 @@ enum SessionOptionCorrection {
         if proposed.preferDualLayerDolbyVision != current.preferDualLayerDolbyVision {
             refused.append("preferDualLayerDolbyVision")
         }
+        // With dual-layer playback asked for, converting to HDR10+ also picks the host: on a display without
+        // Dolby Vision it is what lets a Profile 7 FEL compose on the software host instead of playing its
+        // base layer on the native path. A tuning field everywhere else.
+        if proposed.convertsDolbyVisionToHDR10Plus != current.convertsDolbyVisionToHDR10Plus,
+           proposed.preferDualLayerDolbyVision || current.preferDualLayerDolbyVision {
+            refused.append("convertsDolbyVisionToHDR10Plus")
+        }
         return refused
     }
 

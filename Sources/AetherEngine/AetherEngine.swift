@@ -602,6 +602,10 @@ public final class AetherEngine: ObservableObject {
     /// Decided by `load` and kept across in-place rebuilds, which reach `loadSoftware` without routing.
     var sourceComposesDolbyVisionFEL = false
 
+    /// How a composed FEL picture is presented: Dolby Vision, or HDR10+ on a display without it
+    /// (`LoadOptions.convertsDolbyVisionToHDR10Plus`). Decided by `load` with `sourceComposesDolbyVisionFEL`.
+    var sourceDolbyVisionFELOutput: DolbyVisionFELDecoder.Output = .dolbyVision
+
     /// AE#541: the two load-time terms of the HDR route that a reload cannot take again. The criteria
     /// readout is only an answer around the handshake, and an in-place rebuild runs none, so an audio
     /// pick that routed from the raw `panelIsInHDRMode` alone dropped an HDR title from the master to
@@ -4248,6 +4252,7 @@ public final class AetherEngine: ObservableObject {
         sourceDolbyVisionRPUProfile = nil
         sourceDolbyVisionHDR10PlusAudit = nil
         sourceComposesDolbyVisionFEL = false
+        sourceDolbyVisionFELOutput = .dolbyVision
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
@@ -5220,6 +5225,7 @@ public final class AetherEngine: ObservableObject {
         // a second open, paid only by a Profile 7 that passed every other gate; a custom reader has no
         // second open to give and keeps the conversion.
         var composesFEL = false
+        var felOutputsHDR10Plus = false
         if probeOpened, detectedCodecID == AV_CODEC_ID_HEVC,
            let vStream = probe.stream(at: probe.videoStreamIndex),
            let codecpar = vStream.pointee.codecpar {
@@ -5230,15 +5236,20 @@ public final class AetherEngine: ObservableObject {
                 dvProfile: correctedDVProfile ?? detectedDVProfileNum,
                 enhancementLayerType: nil,
                 displayPresentsDolbyVision: sessionDisplayCaps.supportsDolbyVision,
-                presentsBaseLayerOnly: presentsDolbyVisionBaseLayer,
+                // What the host asked for. A session converting to HDR10+ also routes as the base layer
+                // (`routedDolbyVisionHandling`), but it composes first when it can, so that is not a refusal.
+                presentsBaseLayerOnly: options.dolbyVisionHandling == .baseLayerOnly && detectedDVBaseLayerPresentable,
                 hostAllowsComposition: options.preferDualLayerDolbyVision,
                 isLive: options.isLive,
                 sourceIsSeekable: probe.isSourceSeekable,
                 samplesAreLengthPrefixed: framing == .lengthPrefixed(size: 4),
-                hardwareCanCompose: false)
+                hardwareCanCompose: false,
+                convertsToHDR10Plus: detectedSynthesizesHDR10Plus)
             var shortfall: String?
             if DolbyVisionFELPolicy.worthAuditing(felInputs) {
-                shortfall = DolbyVisionFELDecoder.deviceShortfall()
+                // HDR10+ output decodes the base layer as plain HEVC: no Dolby Vision decoder needed.
+                shortfall = DolbyVisionFELDecoder.deviceShortfall(
+                    requiresDolbyVisionDecode: !felInputs.convertsToHDR10Plus)
                 felInputs.hardwareCanCompose = shortfall == nil
                 if felInputs.hardwareCanCompose, case .url(let felURL) = source {
                     let felHeaders = options.httpHeaders
@@ -5252,22 +5263,33 @@ public final class AetherEngine: ObservableObject {
                     }
                 }
                 composesFEL = DolbyVisionFELPolicy.composes(felInputs)
+                felOutputsHDR10Plus = DolbyVisionFELPolicy.outputsHDR10Plus(felInputs)
             }
             // AE#702: a host that opted in gets one line saying which way a Profile 7 went, and why.
             if options.preferDualLayerDolbyVision, felInputs.dvProfile == 7 {
-                EngineLog.emit(
-                    composesFEL
-                        ? "[AetherEngine] AE#702: DV Profile 7 FEL on a Dolby Vision display: composing base + "
-                          + "enhancement layers on the software host (VideoToolbox decode, Metal composition, "
-                          + "P010 with per-frame Profile 8.1 metadata)"
-                        : "[AetherEngine] AE#702: dual-layer Dolby Vision requested, keeping the single-layer 8.1 "
-                          + "conversion: "
-                          + (DolbyVisionFELPolicy.refusal(felInputs, hardwareShortfall: shortfall) ?? "unknown"),
-                    category: .engine)
+                let line: String
+                if felOutputsHDR10Plus {
+                    line = "DV Profile 7 FEL on a display without Dolby Vision: composing base + enhancement "
+                        + "layers on the software host first, then presenting the composed picture as HDR10+ "
+                        + "(per-frame metadata from the RPU's L1, MaxCLL / MaxFALL from its L6)"
+                } else if composesFEL {
+                    line = "DV Profile 7 FEL on a Dolby Vision display: composing base + enhancement layers on "
+                        + "the software host (VideoToolbox decode, Metal composition, P010 with per-frame "
+                        + "Profile 8.1 metadata)"
+                } else {
+                    line = "dual-layer Dolby Vision requested, keeping the single-layer route: "
+                        + (DolbyVisionFELPolicy.refusal(felInputs, hardwareShortfall: shortfall) ?? "unknown")
+                }
+                EngineLog.emit("[AetherEngine] AE#702: \(line)", category: .engine)
             }
             if composesFEL { useSoftwarePath = true }
         }
         sourceComposesDolbyVisionFEL = composesFEL
+        // The composed picture's presentation, kept with the decision for in-place rebuilds.
+        sourceDolbyVisionFELOutput = felOutputsHDR10Plus
+            ? .hdr10Plus(nativeHDR10Plus: detectedHDR10PlusAudit?.nativeHDR10Plus,
+                         staticMetadata: detectedHDR10PlusAudit?.staticMetadata)
+            : .dolbyVision
         EngineLog.emit("[AetherEngine] dispatch: codec=\(detectedCodecID.rawValue) → \(useSoftwarePath ? "software" : "native")", category: .engine)
         // #361: routing is settled here and not at the first `useSoftwarePath` assignment; the
         // interlace refute probe and the VideoToolbox capability probe above can both overturn it,
@@ -6567,6 +6589,7 @@ public final class AetherEngine: ObservableObject {
         sourceDolbyVisionRPUProfile = nil
         sourceDolbyVisionHDR10PlusAudit = nil
         sourceComposesDolbyVisionFEL = false
+        sourceDolbyVisionFELOutput = .dolbyVision
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil

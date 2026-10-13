@@ -42,6 +42,38 @@ public enum DolbyVisionHDR10PlusAudit {
         public var maxCLL: Int
         public var maxFALL: Int
         public var primaries: [Double]
+
+        /// The `kCVImageBufferMasteringDisplayColorVolumeKey` value: 24 bytes laid out as the HEVC
+        /// `mastering_display_colour_volume` SEI payload (SMPTE ST 2086), big endian: the green, blue and
+        /// red primaries and the white point in 0.00002 units, then peak and minimum luminance in
+        /// 0.0001 cd/m2. nil when the primaries are malformed.
+        public var masteringDisplayColorVolume: Data? {
+            guard primaries.count == 8 else { return nil }
+            var bytes: [UInt8] = []
+            func u16(_ v: Double) {
+                let n = UInt16(clamping: Int((v * 50000).rounded()))
+                bytes += [UInt8(n >> 8), UInt8(n & 0xFF)]
+            }
+            func u32(_ v: Double) {
+                let n = UInt32(clamping: Int((v * 10000).rounded()))
+                bytes += [UInt8(n >> 24), UInt8((n >> 16) & 0xFF), UInt8((n >> 8) & 0xFF), UInt8(n & 0xFF)]
+            }
+            for index in [2, 4, 0] {               // ST 2086 / the SEI order: green, blue, red
+                u16(primaries[index]); u16(primaries[index + 1])
+            }
+            u16(primaries[6]); u16(primaries[7])
+            u32(maxMasteringLuminance)
+            u32(minMasteringLuminance)
+            return Data(bytes)
+        }
+
+        /// The `kCVImageBufferContentLightLevelInfoKey` value: MaxCLL then MaxFALL, 16-bit big endian, the
+        /// HEVC `content_light_level_info` SEI payload. nil when the RPU states no MaxCLL.
+        public var contentLightLevelInfo: Data? {
+            guard maxCLL > 0 else { return nil }
+            let cll = UInt16(clamping: maxCLL), fall = UInt16(clamping: max(maxFALL, 0))
+            return Data([UInt8(cll >> 8), UInt8(cll & 0xFF), UInt8(fall >> 8), UInt8(fall & 0xFF)])
+        }
     }
 
     /// Video packets to walk. HDR10+ and the RPU are both per frame, so the first video packet answers

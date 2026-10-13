@@ -20,6 +20,18 @@ import AetherLibavutil
 /// the values. The converted RPU's mapping is the identity, which is correct for the composed picture:
 /// it already IS the mapped signal.
 ///
+/// HDR10+ output (`Output.hdr10Plus`, a display without Dolby Vision with
+/// `LoadOptions.convertsDolbyVisionToHDR10Plus`): the composition runs first, and the composed picture goes
+/// out as HDR10 carrying per-frame HDR10+ and HDR10 static metadata that describe IT, not the base layer.
+/// A Full Enhancement Layer can move luma a long way from the base layer, so the base layer's own
+/// MaxCLL / MaxFALL and dynamic metadata are the wrong numbers for the composed picture. The RPU's are the
+/// right ones: L1 is measured on the reconstructed (composed) signal and L6 states the composed master's
+/// MaxCLL / MaxFALL, so HDR10+ is derived from L1 (`DolbyVisionHDR10PlusSynthesizer.payload`) and the static
+/// metadata is replaced by L6. Without an L6 the base layer's MaxCLL / MaxFALL is removed rather than kept,
+/// because absent is honest and the base layer's value can understate the composed peak. The source's own
+/// HDR10+, where it has any, still wins over the derived one. The base layer is decoded as plain HEVC
+/// (no `dvvC`), so no Dolby Vision metadata is attached to the picture to contradict the HDR10+.
+///
 /// Degrades rather than fails. No composer (no Metal, kernel did not build), an RPU the kernel does not
 /// implement, a missing or failed enhancement picture, a GPU error: the base picture goes out as it is,
 /// which is the single-layer Profile 8.1 picture the engine showed before this path existed. A session
@@ -97,15 +109,49 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
-    init(composer: DolbyVisionFELComposer? = DolbyVisionFELComposer()) {
+    /// What the composed picture is presented as.
+    enum Output: Sendable, Equatable {
+        /// Profile 8.1 Dolby Vision, the display doing the display management. A display with Dolby Vision.
+        case dolbyVision
+        /// HDR10 with per-frame HDR10+ and the RPU's static metadata. A display without Dolby Vision, under
+        /// `LoadOptions.convertsDolbyVisionToHDR10Plus`. `nativeHDR10Plus` and `staticMetadata` are the
+        /// load's audit (`DolbyVisionHDR10PlusAudit`); a missing L6 is read from the stream's own RPUs.
+        case hdr10Plus(nativeHDR10Plus: DolbyVisionHDR10PlusAudit.Result.NativeHDR10Plus?,
+                       staticMetadata: DolbyVisionHDR10PlusAudit.StaticMetadata?)
+    }
+
+    let output: Output
+    private var outputsHDR10Plus: Bool { if case .hdr10Plus = output { return true } else { return false } }
+    /// HDR10+ output only: the per-picture decision, fed in decode order from `decode`.
+    private let hdr10Plus: DolbyVisionHDR10PlusSynthesizer?
+    /// HDR10+ output only: per access unit, the T.35 payload the composed picture carries.
+    private var hdr10PlusByKey: [Key: Data] = [:]
+    /// HDR10+ output only: the composed master's static metadata (L6), from the audit or the first RPU
+    /// that states it. Read on the compose queue, written in `decode`, both under `stateLock`.
+    private var staticMetadata: DolbyVisionHDR10PlusAudit.StaticMetadata?
+    private var staticMetadataSettled = false
+    private var reportedHDR10Plus = false
+    private var loggedStaticMetadata = false
+
+    init(composer: DolbyVisionFELComposer? = DolbyVisionFELComposer(), output: Output = .dolbyVision) {
         self.composer = composer
+        self.output = output
+        if case .hdr10Plus(let native, let metadata) = output {
+            hdr10Plus = DolbyVisionHDR10PlusSynthesizer(nativeHDR10Plus: native)
+            staticMetadata = metadata
+            staticMetadataSettled = metadata != nil
+        } else {
+            hdr10Plus = nil
+        }
     }
 
     /// What this device lacks for the path, or nil when it has it all: a Metal GPU for the composer,
-    /// hardware HEVC decode for the enhancement layer, and hardware Dolby Vision HEVC decode for the base
-    /// layer, which is what attaches the per-frame metadata the display layer presents with. Whether the
-    /// display presents Dolby Vision is the routing's question, not this one.
+    /// hardware HEVC decode for the enhancement layer, and, for Dolby Vision output, hardware Dolby Vision
+    /// HEVC decode for the base layer, which is what attaches the per-frame metadata the display layer
+    /// presents with. HDR10+ output decodes the base layer as plain HEVC and attaches its own metadata, so
+    /// it does not need the last. Whether the display presents Dolby Vision is the routing's question.
     static func deviceShortfall(
+        requiresDolbyVisionDecode: Bool = true,
         hasMetal: Bool = DolbyVisionFELComposer.deviceHasMetal,
         decodesHEVC: Bool = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC),
         decodesDolbyVision: Bool = VTIsHardwareDecodeSupported(kCMVideoCodecType_DolbyVisionHEVC)
@@ -113,7 +159,7 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var missing: [String] = []
         if !hasMetal { missing.append("no Metal GPU") }
         if !decodesHEVC { missing.append("no hardware HEVC decode") }
-        if !decodesDolbyVision { missing.append("no hardware Dolby Vision decode") }
+        if requiresDolbyVisionDecode, !decodesDolbyVision { missing.append("no hardware Dolby Vision decode") }
         return missing.isEmpty ? nil : missing.joined(separator: ", ")
     }
 
@@ -138,17 +184,24 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
             width: codecpar.pointee.width, height: codecpar.pointee.height)
 
         let level = Self.dolbyVisionLevel(codecpar: codecpar) ?? 6
-        let atoms: NSDictionary = [
-            "hvcC": Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size)),
-            "dvvC": Data(DolbyVisionEnhancementLayer.profile81ConfigurationRecord(level: level)),
-        ]
+        // HDR10+ output decodes the base layer as the plain HEVC it is: no `dvvC`, so VideoToolbox attaches
+        // no Dolby Vision metadata for the display layer to act on beside the HDR10+.
+        let atoms: NSDictionary = outputsHDR10Plus
+            ? ["hvcC": Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))]
+            : [
+                "hvcC": Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size)),
+                "dvvC": Data(DolbyVisionEnhancementLayer.profile81ConfigurationRecord(level: level)),
+            ]
         let extensions: NSDictionary = [kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms]
         let width = codecpar.pointee.width, height = codecpar.pointee.height
 
         // `dvh1` first: that is what makes VideoToolbox read the stream as Dolby Vision. A decoder that
         // refuses it still decodes the base layer as `hvc1`, with the `dvvC` next to it.
         var lastStatus: OSStatus = noErr
-        for codecType in [kCMVideoCodecType_DolbyVisionHEVC, kCMVideoCodecType_HEVC] {
+        let codecTypes = outputsHDR10Plus
+            ? [kCMVideoCodecType_HEVC]
+            : [kCMVideoCodecType_DolbyVisionHEVC, kCMVideoCodecType_HEVC]
+        for codecType in codecTypes {
             var fd: CMVideoFormatDescription?
             lastStatus = CMVideoFormatDescriptionCreate(
                 allocator: kCFAllocatorDefault, codecType: codecType, width: width, height: height,
@@ -163,7 +216,10 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 baseBox = box
                 EngineLog.emit(
                     "[DVFEL] base layer session open as \(DecodedVideoFormat.fourCC(codecType)) "
-                    + "\(width)x\(height), Profile 8.1 level \(level); composer "
+                    + "\(width)x\(height), "
+                    + (outputsHDR10Plus ? "HDR10+ output (composed picture, RPU L1 / L6 metadata)"
+                                        : "Profile 8.1 level \(level)")
+                    + "; composer "
                     + (composer == nil ? "UNAVAILABLE (base layer alone)" : "ready"),
                     category: .swPlayback)
                 return
@@ -237,6 +293,12 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let params = composer == nil
             ? nil
             : DolbyVisionComposerParams.fromAccessUnit(data, size, framing: framing)?.packed()
+        // HDR10+ output: what the composed picture carries, from the source packet's own RPU (its L1 is the
+        // composed signal's) or the source's own HDR10+. Decided here, in decode order, where the shot
+        // carry-over of a picture without an L1 is meaningful.
+        let hdr10PlusPayload = hdr10Plus?.payload(for: packet, framing: framing).t35.map { Data($0) }
+        let latchedMetadata = outputsHDR10Plus && !staticMetadataSettledSnapshot()
+            ? Self.staticMetadata(inAccessUnit: data, size, framing: framing) : nil
 
         // The base access unit as the single-layer Profile 8.1 the session was opened for. A clone,
         // because the packet is the demux loop's and may be stored for a later seek.
@@ -252,10 +314,19 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let enhancementReady = params != nil && !elNALs.isEmpty && prepareEnhancementSession(for: elNALs)
 
         stateLock.lock()
-        if let params {
-            paramsByKey[key] = params
+        if let latchedMetadata, !staticMetadataSettled {
+            staticMetadata = latchedMetadata
+            staticMetadataSettled = true
+        }
+        if let hdr10PlusPayload { hdr10PlusByKey[key] = hdr10PlusPayload }
+        if params != nil || hdr10PlusPayload != nil {
+            if let params { paramsByKey[key] = params }
             paramsOrder.append(key)
-            while paramsOrder.count > 64 { paramsByKey.removeValue(forKey: paramsOrder.removeFirst()) }
+            while paramsOrder.count > 64 {
+                let old = paramsOrder.removeFirst()
+                paramsByKey.removeValue(forKey: old)
+                hdr10PlusByKey.removeValue(forKey: old)
+            }
         }
         if enhancementReady { pairing.expectEnhancement(key) }
         stateLock.unlock()
@@ -414,6 +485,7 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         draining = false
         pairing.reset()
         paramsByKey.removeAll()
+        hdr10PlusByKey.removeAll()
         paramsOrder.removeAll()
         stateLock.unlock()
     }
@@ -440,6 +512,7 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         stateLock.lock()
         pairing.reset()
         paramsByKey.removeAll()
+        hdr10PlusByKey.removeAll()
         paramsOrder.removeAll()
         _onFrame = nil
         stateLock.unlock()
@@ -487,20 +560,27 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private struct ComposeJob: @unchecked Sendable {
         let pair: DolbyVisionFramePairing<CVPixelBuffer>.Pair
         let params: [Float]?
+        let hdr10Plus: Data?
     }
 
     /// `stateLock` held.
     private func enqueueLocked(_ ready: [DolbyVisionFramePairing<CVPixelBuffer>.Pair]) {
         guard !ready.isEmpty else { return }
         let generation = deliveryGeneration
-        let jobs = ready.map { ComposeJob(pair: $0, params: paramsByKey.removeValue(forKey: $0.key)) }
+        let jobs = ready.map {
+            ComposeJob(pair: $0, params: paramsByKey.removeValue(forKey: $0.key),
+                       hdr10Plus: hdr10PlusByKey.removeValue(forKey: $0.key))
+        }
         composeQueue.async { [weak self] in
-            for job in jobs { self?.deliver(job.pair, params: job.params, generation: generation) }
+            for job in jobs {
+                self?.deliver(job.pair, params: job.params, hdr10PlusPayload: job.hdr10Plus, generation: generation)
+            }
         }
     }
 
     /// Compose queue only.
-    private func deliver(_ pair: DolbyVisionFramePairing<CVPixelBuffer>.Pair, params: [Float]?, generation: UInt64) {
+    private func deliver(_ pair: DolbyVisionFramePairing<CVPixelBuffer>.Pair, params: [Float]?,
+                         hdr10PlusPayload: Data?, generation: UInt64) {
         stateLock.lock()
         let current = generation == deliveryGeneration
         let threshold = _skipUntilPTS
@@ -515,7 +595,7 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
             stateLock.unlock()
         }
 
-        logDolbyVisionMetadataOnce(pair.base)
+        if !outputsHDR10Plus { logDolbyVisionMetadataOnce(pair.base) }
         var picture: CVPixelBuffer = pair.base
         if let composer, let params,
            let composed = composer.compose(base: pair.base, enhancement: pair.enhancement, params: params) {
@@ -525,7 +605,7 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if let attachments = CVBufferCopyAttachments(pair.base, .shouldPropagate) {
                 CVBufferSetAttachments(composed, attachments, .shouldPropagate)
             }
-            Self.copyDolbyVisionMetadata(from: pair.base, to: composed)
+            if !outputsHDR10Plus { Self.copyDolbyVisionMetadata(from: pair.base, to: composed) }
             picture = composed
             composedCount += 1
             if !loggedFirstComposition {
@@ -541,8 +621,64 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
             baseOnlyCount += 1
         }
         attachColour(picture)
+        var frameHDR10Plus: Data?
+        if outputsHDR10Plus {
+            attachStaticMetadata(picture)
+            frameHDR10Plus = hdr10PlusPayload
+            if hdr10PlusPayload != nil, !reportedHDR10Plus {
+                reportedHDR10Plus = true
+                onFirstHDR10PlusDetected?()
+            }
+        }
         reportFormat(picture)
-        handler(picture, pts, nil)
+        handler(picture, pts, frameHDR10Plus)
+    }
+
+    /// HDR10+ output: the composed master's static metadata on the picture, replacing the base layer's.
+    /// No L6 keeps the base layer's mastering display (the monitor is the one both layers were graded on)
+    /// but removes its MaxCLL / MaxFALL, which the enhancement layer can exceed.
+    private func attachStaticMetadata(_ buffer: CVPixelBuffer) {
+        for key in DolbyVisionUndocumentedKeys.perFrameMetadata {
+            CVBufferRemoveAttachment(buffer, key as CFString)
+        }
+        stateLock.lock()
+        let metadata = staticMetadata
+        stateLock.unlock()
+        if let mdcv = metadata?.masteringDisplayColorVolume {
+            CVBufferSetAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, mdcv as CFData,
+                                  .shouldPropagate)
+        }
+        if let cll = metadata?.contentLightLevelInfo {
+            CVBufferSetAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, cll as CFData, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(buffer, kCVImageBufferContentLightLevelInfoKey)
+        }
+        if !loggedStaticMetadata {
+            loggedStaticMetadata = true
+            EngineLog.emit(
+                "[DVFEL] HDR10 static metadata for the composed picture: "
+                + (metadata.map {
+                    "RPU L6 MaxCLL=\($0.maxCLL) MaxFALL=\($0.maxFALL) mastering peak=\(Int($0.maxMasteringLuminance))"
+                } ?? "no L6, the base layer's MaxCLL / MaxFALL removed"),
+                category: .swPlayback)
+        }
+    }
+
+    private func staticMetadataSettledSnapshot() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return staticMetadataSettled
+    }
+
+    /// L6 of the access unit's RPU, if it has one that states it.
+    static func staticMetadata(
+        inAccessUnit data: UnsafePointer<UInt8>, _ size: Int, framing: VideoNALFraming
+    ) -> DolbyVisionHDR10PlusAudit.StaticMetadata? {
+        var found: DolbyVisionHDR10PlusAudit.StaticMetadata?
+        A53SEIParser.forEachNAL(data, size, framing) { nal, length in
+            guard found == nil, length > 2, (nal[0] >> 1) & 0x3F == 62 else { return }
+            found = DolbyVisionHDR10PlusAudit.staticMetadata(ofRPU: nal, length: length)
+        }
+        return found
     }
 
     /// Carry the frame's undocumented Dolby Vision attachments (`DolbyVisionUndocumentedKeys`) from the

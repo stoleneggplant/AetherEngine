@@ -925,7 +925,7 @@ final class SoftwarePlaybackHost {
            let codecpar = vStream.pointee.codecpar,
            codecpar.pointee.codec_id == AV_CODEC_ID_HEVC {
             videoDecoder.close()
-            videoDecoder = DolbyVisionFELDecoder()
+            videoDecoder = DolbyVisionFELDecoder(output: dolbyVisionFELOutput)
             EngineLog.emit(
                 "[SWHost] selected DolbyVisionFELDecoder (VT base + enhancement layers, Metal composition)",
                 category: .swPlayback
@@ -1260,6 +1260,9 @@ final class SoftwarePlaybackHost {
     /// when that decoder cannot open and the host falls back to the base layer, so the engine reads
     /// what was actually served.
     var composesDolbyVisionFEL = false
+    /// How the composed FEL picture is presented (`DolbyVisionFELDecoder.Output`): Dolby Vision, or HDR10+
+    /// on a display without it. Set by the engine with `composesDolbyVisionFEL`.
+    var dolbyVisionFELOutput: DolbyVisionFELDecoder.Output = .dolbyVision
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.

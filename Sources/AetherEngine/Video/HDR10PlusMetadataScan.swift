@@ -260,6 +260,23 @@ enum HDR10PlusMetadataScan {
         return body[bodySize - 1] & UInt8((1 << padding) - 1) == 0
     }
 
+    /// The first validated in-band ST 2094-40 message of an HEVC / H.264 packet as a complete
+    /// `user_data_registered_itu_t_t35` payload (country code on, emulation prevention removed): the form
+    /// `kCMSampleAttachmentKey_HDR10PlusPerFrameData` takes. nil when the packet carries none.
+    static func inBandT35Payload(
+        _ data: UnsafePointer<UInt8>?, size: Int, codecID: AVCodecID, framing: VideoNALFraming
+    ) -> [UInt8]? {
+        guard let data, size > 0, codecID == AV_CODEC_ID_HEVC || codecID == AV_CODEC_ID_H264,
+              mayContainT35Header(data, size: size) else { return nil }
+        var captured: [UInt8]?
+        _ = scanNALs(UnsafeBufferPointer(start: data, count: size), codecID: codecID, framing: framing) { bytes, count in
+            guard captured == nil, validT35(bytes, count) else { return false }
+            captured = Array(UnsafeBufferPointer(start: bytes, count: count))
+            return true
+        }
+        return captured
+    }
+
     /// The HDR10+ a packet carries only as side data (a Matroska BlockAddition, which FFmpeg hands on parsed
     /// and never as bitstream), serialized back into a complete `user_data_registered_itu_t_t35` payload from
     /// the country code on: the form an HEVC SEI carries. nil when the packet has none, or what it has does

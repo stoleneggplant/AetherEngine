@@ -25,6 +25,15 @@ the public-API contract.
   which cannot tell a display without Dolby Vision from one it was not told about. The mapping and its
   references (dovi_tool, libplacebo, hdr10plus_tool) are in
   [formats.md](docs/formats.md#dolby-vision-to-hdr10). `aetherctl` takes it as `--dv-hdr10plus`.
+- **A Profile 7 FEL composes before it is converted to HDR10+.** With `preferDualLayerDolbyVision` and
+  `convertsDolbyVisionToHDR10Plus` both set, a display without Dolby Vision gets the composed FEL picture
+  instead of the base layer: the software host composes both layers as it does for a Dolby Vision display
+  and presents the result as HDR10 with per-frame HDR10+ (`kCMSampleAttachmentKey_HDR10PlusPerFrameData`).
+  Because the enhancement layer can move luma far from the base layer, the metadata describes the composed
+  picture: HDR10+ from the RPU's L1 (or the source's own HDR10+), MaxCLL / MaxFALL and the mastering
+  display from its L6, replacing the base layer's; without an L6 the base layer's MaxCLL / MaxFALL is
+  dropped rather than understated. `dolbyVisionConversion` reads `.profile7FELComposedToHDR10Plus`.
+
 - **Dolby Vision Profile 7 FEL can play dual-layer (opt-in, AE#702).** The Profile 7 to 8.1 conversion
   keeps the RPU and discards the enhancement layer, which for a Full Enhancement Layer loses the
   residual the picture was mastered with. With `LoadOptions.preferDualLayerDolbyVision = true`, a display

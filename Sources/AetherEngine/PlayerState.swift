@@ -1088,6 +1088,11 @@ public enum DolbyVisionConversion: Sendable, Equatable {
     /// into the picture the FEL was mastered to, and presented as Profile 8.1 (the composed signal with
     /// the RPU's display management metadata). See `LoadOptions.preferDualLayerDolbyVision`.
     case profile7FELComposedToProfile81
+    /// Dual-layer Profile 7 with a Full Enhancement Layer, composed on the GPU as above, on a display
+    /// without Dolby Vision: the composed picture is presented as HDR10 with per-frame HDR10+, derived from
+    /// the RPU's L1 (or the source's own HDR10+), and the RPU's L6 MaxCLL / MaxFALL, all of which describe
+    /// the composed picture rather than the base layer. See `LoadOptions.convertsDolbyVisionToHDR10Plus`.
+    case profile7FELComposedToHDR10Plus
 }
 
 /// One-shot container + stream metadata from `AetherEngine.probe(url:options:)`. No HLS server, no decoders.

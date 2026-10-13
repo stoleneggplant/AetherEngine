@@ -1923,6 +1923,7 @@ extension AetherEngine {
         let host = SoftwarePlaybackHost(videoGravity: _videoGravity)
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         host.composesDolbyVisionFEL = sourceComposesDolbyVisionFEL
+        host.dolbyVisionFELOutput = sourceDolbyVisionFELOutput
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate
@@ -2073,7 +2074,11 @@ extension AetherEngine {
         // layer; that session, and every rebuild of it, is not a composed one.
         sourceComposesDolbyVisionFEL = sourceComposesDolbyVisionFEL && host.composesDolbyVisionFEL
         if sourceComposesDolbyVisionFEL {
-            dolbyVisionConversion = .profile7FELComposedToProfile81
+            if case .hdr10Plus = sourceDolbyVisionFELOutput {
+                dolbyVisionConversion = .profile7FELComposedToHDR10Plus
+            } else {
+                dolbyVisionConversion = .profile7FELComposedToProfile81
+            }
         }
     }
 
