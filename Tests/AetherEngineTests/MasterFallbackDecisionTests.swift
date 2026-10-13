@@ -3,6 +3,17 @@ import Testing
 @testable import AetherEngine
 
 struct MasterFallbackDecisionTests {
+    @Test("a malformed media playlist is not evidence of display incompatibility")
+    func malformedMedia() {
+        let parser = NSError(domain: "CoreMediaErrorDomain", code: -12642)
+        let wrapped = NSError(domain: "AVFoundationErrorDomain", code: -11848,
+            userInfo: [NSUnderlyingErrorKey: parser])
+        #expect(!MasterFallbackDecision.isMasterRejection(wrapped))
+        let generic = NSError(domain: "AVFoundationErrorDomain", code: -11848)
+        #expect(!MasterFallbackDecision.isMasterRejection(generic, mediaErrorCodes: [-12642]))
+        #expect(MasterFallbackDecision.isMasterRejection(generic))
+    }
+
 
     @Test("Display-rejection codes are the two AVFoundation display-reject codes")
     func recognisesRejectionCodes() {

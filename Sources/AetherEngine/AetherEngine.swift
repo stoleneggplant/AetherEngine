@@ -803,6 +803,7 @@ public final class AetherEngine: ObservableObject {
     /// the keepalive policy + pause-safety read it.
     public var pictureInPictureActive = false {
         didSet {
+            nativeHost?.pictureInPictureActive = pictureInPictureActive
             // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
             // window and never double-draw under the fullscreen host overlay.
             softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive, delaySeconds: softwareSubtitleDelaySeconds)
@@ -1483,9 +1484,33 @@ public final class AetherEngine: ObservableObject {
     /// Forwarder; see `clock.behindLiveSeconds`.
     public var behindLiveSeconds: Double { clock.behindLiveSeconds }
 
-    /// Fires when the live source restarted from byte 0 (e.g. a Jellyfin transcode respawn). The engine has
-    /// parked the session; the host must negotiate a fresh transcode URL and call `load`. No replay; subscribe per session.
+    /// Fires when a live session cannot continue through its bounded in-engine source reopen.
+    /// A verified replay first reopens a supported source while retaining its cache and packet
+    /// history. When fresh negotiation is needed, production is parked and the host must call
+    /// `load` with a fresh source under its bounded retune policy. Subscribe per session.
     public let liveSourceReset = PassthroughSubject<Void, Never>()
+
+    /// Bounded recovery could not find new media after a verified replay. Cached DVR media
+    /// remains readable, but automatic `load` would discard its history and permit the same
+    /// broadcast to play again. The host can retry with `retryLiveSourceRecovery()` after
+    /// its own backoff; this is not a codec failure. Fires only under
+    /// `LoadOptions.hostRetriesExhaustedLiveReplay`; otherwise the exhaustion is a `liveSourceReset`.
+    /// Subscribe per session.
+    public let liveSourceReplayExhausted = PassthroughSubject<Void, Never>()
+
+    /// Resume a parked live source without replacing the consumer item, DVR cache or replay
+    /// evidence. Returns true when the retained session accepted the retry or has a retry in flight;
+    /// false when this route cannot continue it. Calls coalesce; the host owns retry timing.
+    @discardableResult
+    public func retryLiveSourceRecovery() -> Bool {
+        guard isLive, nativeVideoSession?.retryLiveSourceRecovery() == true else { return false }
+        liveOutageSourceGivenUp = false
+        // A timeshifted viewer can still be consuming cached runway. Restart the outage
+        // watcher only if that item actually ended, never replace it merely because the
+        // source connection is being renewed behind it.
+        if nativeHost?.didReachEnd == true { handleLiveOutageWindowExhausted() }
+        return true
+    }
 
     /// AE#444 follow-up (Sodalite#104): fires when a resume found the playhead outside the DVR window
     /// and moved it forward.
@@ -3145,9 +3170,10 @@ public final class AetherEngine: ObservableObject {
     ///   whose seekable end IS the playhead, so the distance-behind-live that policy reads is zero and it
     ///   would aim at the edge, discarding the rewind the viewer kept through the whole outage.
     func reloadStalledConsumerItem(position: Double, allowPausedConsumer: Bool = false,
-                                   liveRejoinOverride: Double? = nil) {
+                                   liveRejoinOverride: Double? = nil,
+                                   preserveLivePosition: Double? = nil, replacementURL: URL? = nil) {
         guard let host = nativeHost, let player = currentAVPlayer,
-              let url = (player.currentItem?.asset as? AVURLAsset)?.url else { return }
+              let url = replacementURL ?? (player.currentItem?.asset as? AVURLAsset)?.url else { return }
         // Item death parks tcs at .paused; only that trigger may bypass the user-pause guard.
         guard Self.stalledConsumerRecoveryAllowed(
             consumerIsPaused: player.timeControlStatus == .paused,
@@ -3167,14 +3193,19 @@ public final class AetherEngine: ObservableObject {
             behindWhenLastAdvancing: liveBehindWhenLastAdvancing,
             residentRange: liveWindow?.seekableRange,
             targetDurationSeconds: liveTargetDurationSeconds)
-        let rejoinPosition = policyRejoin ?? liveRejoinOverride
+        let rejoinPosition = preserveLivePosition
+            ?? (replacementURL == nil ? (policyRejoin ?? liveRejoinOverride) : liveRejoinOverride)
         // AE#446 round 3: name which of the two decided, because they mean different things and the
         // difference is exactly what a reader of this line is trying to establish. The policy reads
         // how far behind live the item was; a window closed with ENDLIST is a finite asset whose
         // seekable end IS the playhead, so that distance reads zero there and printing it next to a
         // carried position says nothing true about a timeshifted viewer.
         let liveTarget: String = rejoinPosition.map { position in
-            let provenance = policyRejoin != nil
+            let provenance = preserveLivePosition != nil
+                ? "(video presentation repair at the current playhead)"
+                : replacementURL != nil
+                ? "(preserving the current position across playlist renewal)"
+                : policyRejoin != nil
                 ? "(\(String(format: "%.1f", liveBehindWhenLastAdvancing))s behind live when the "
                   + "picture last moved, still resident)"
                 : "(carried across the swap: the window it played out under was closed, so its own "
@@ -3182,12 +3213,14 @@ public final class AetherEngine: ObservableObject {
             return "\(String(format: "%.2f", position))s, the place it held \(provenance)"
         } ?? "the live edge (rejoin)"
         EngineLog.emit(
-            "[AetherEngine] #65 nudge did not revive the consumer; reloading item at "
+            (replacementURL == nil
+                ? "[AetherEngine] #65 nudge did not revive the consumer; reloading item at "
+                : "[AetherEngine] live playlist timing changed; replacing item at ")
             + (isLive ? liveTarget : "\(String(format: "%.2f", anchor))s")
             + Self.recoveryAnchorLogSuffix(
                 anchor: anchor, position: position,
                 pendingSeekTarget: pendingRecoverySeekClockTarget)
-            + " (same URL, same host)",
+            + (replacementURL == nil ? " (same URL, same host)" : " (new playlist URL, same source and cache)"),
             category: .engine
         )
         // AE#454: the placement, expressed in the playlist the fresh item is about to load. A rejoin
@@ -3212,6 +3245,10 @@ public final class AetherEngine: ObservableObject {
                     + "to be corrected off it",
                     category: .engine)
             } else {
+                if preserveLivePosition != nil {
+                    EngineLog.emit("[AetherEngine] video presentation repair deferred: current position is not resident; preserving playback", category: .engine)
+                    return
+                }
                 EngineLog.emit(
                     "[AetherEngine] #454 the place it held is not in a segment the producer still "
                     + "holds, so the fresh item joins as before and the stashed seek decides",
@@ -4556,7 +4593,7 @@ public final class AetherEngine: ObservableObject {
 
         // Custom sources have no URL to reopen from: a failed probe is fatal.
         if case .custom = source, !probeOpened {
-            publishError(.customSourceProbeFailed, "Failed to load: custom source probe failed")
+            publishError(.customSourceProbeFailed, "Failed to load: custom source probe failed", underlying: probeFailure)
             throw DemuxerError.openFailed(code: -1)
         }
 
@@ -4720,9 +4757,11 @@ public final class AetherEngine: ObservableObject {
             tracks: probedAudioTracks,
             override: audioSourceStreamIndex,
             preferredLanguages: options.preferredAudioLanguages,
-            // Only where the spatial bridge can run: the loopback route of a VOD video session. Live,
-            // audio-only and the software path would decode TrueHD for its 7.1 bed and no heights.
-            prefersTrueHDAtmos: options.objectAudioRendering != .off && !options.isLive && !options.audioOnly
+            // Only where the spatial bridge can run: the loopback route of a VOD video session on an OS
+            // with the APAC encoder. Live, audio-only, the software path and older systems would decode
+            // TrueHD or DTS for its 7.1 bed and no heights, so the default track keeps its place there.
+            prefersObjectAudio: options.objectAudioRendering != .off && ObjectAudioRendering.isAvailable
+                && !options.isLive && !options.audioOnly
                 && !VideoRoutingPolicy.requiresSoftwarePath(
                     codecID: detectedCodecID, fieldOrder: detectedFieldOrder,
                     av1Available: VTCapabilityProbe.av1Available),

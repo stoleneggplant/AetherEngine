@@ -62,6 +62,9 @@ protocol HLSSegmentProvider: AnyObject {
     /// Session-stable TARGETDURATION for a live playlist. Production providers seal the first resolved
     /// value so later cadence or visible-segment growth cannot mutate RFC 8216 playlist timing.
     func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int
+    var livePlaylistGeneration: Int { get }
+    func livePlaylistEndIndex(generation: Int) -> Int?
+    func liveTargetDurationSeconds(maxSegmentDuration: Double, generation: Int) -> Int
 
     /// #316: a master to serve VERBATIM instead of building one from the metadata below. The remote-HLS
     /// subtitle proxy fills this with the origin's own master, rewritten to absolute URIs plus the
@@ -161,6 +164,12 @@ protocol HLSSegmentProvider: AnyObject {
 }
 
 extension HLSSegmentProvider {
+    var livePlaylistGeneration: Int { 0 }
+    func livePlaylistEndIndex(generation: Int) -> Int? { nil }
+    func liveTargetDurationSeconds(maxSegmentDuration: Double, generation: Int) -> Int {
+        liveTargetDurationSeconds(maxSegmentDuration: maxSegmentDuration)
+    }
+
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
     func mediaSegmentSource(at index: Int, onSlow: (@Sendable () -> Void)?) -> SegmentSource? {
         mediaSegment(at: index, onSlow: onSlow).map { .data($0) }
@@ -339,7 +348,28 @@ final class HLSLocalServer: @unchecked Sendable {
         // is still the playlist AVPlayer must open, or the injected renditions never reach media selection.
         let hasMaster = provider?.masterCodecs != nil || provider?.staticMasterPlaylistBody != nil
         let path = hasMaster ? "master.m3u8" : "media.m3u8"
-        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(path)")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)\(path)")
+    }
+
+    private var livePlaylistPrefix: String {
+        let generation = provider?.livePlaylistGeneration ?? 0
+        return generation == 0 ? "" : "live-\(generation)/"
+    }
+
+    func renewedLivePlaylistURL(replacing url: URL) -> URL? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard port > 0, provider?.playlistType == .live,
+              url.port == Int(port), Self.pathAfterToken(pathToken, in: url.path) != nil else { return nil }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.path = "/\(pathToken)/\(livePlaylistPrefix)\(url.lastPathComponent)"
+        return components?.url
+    }
+
+    static func livePlaylistRoute(_ path: String) -> (path: String, generation: Int) {
+        let parts = path.split(separator: "/", maxSplits: 1)
+        guard parts.count == 2, parts[0].hasPrefix("live-"),
+              let generation = Int(parts[0].dropFirst(5)), generation > 0 else { return (path, 0) }
+        return ("/" + parts[1], generation)
     }
 
     /// Direct media.m3u8 URL, bypassing master-playlist variant selection (used when the DV/HDR handshake is unavailable so AVPlayer doesn't try to match a dvh1 master on an SDR panel).
@@ -347,7 +377,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0 else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/media.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)media.m3u8")
     }
 
     /// HDR-preserving reduced master (#98): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
@@ -356,7 +386,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0, provider?.masterCodecs != nil else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/master_hdr.m3u8")
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)master_hdr.m3u8")
     }
 
     /// Numeric address of the peer on an accepted connection, or nil if the socket is already gone (#227 diag).
@@ -974,7 +1004,11 @@ final class HLSLocalServer: @unchecked Sendable {
             _ = send404(fd: fd, path: path, reason: "bad session token", logged: false)
             return false
         }
-        let normalizedPath = (routePath == "/audio.m3u8") ? "/media.m3u8" : routePath
+        let route = Self.livePlaylistRoute(routePath)
+        guard route.generation <= (provider?.livePlaylistGeneration ?? 0) else {
+            return send404(fd: fd, path: routePath, reason: "unknown playlist generation")
+        }
+        let normalizedPath = (route.path == "/audio.m3u8") ? "/media.m3u8" : route.path
         let loggedRequest = Self.requestLineForLog(
             method: parts[0], routePath: routePath, query: query,
             version: parts.count > 2 ? parts[2] : nil)
@@ -1113,7 +1147,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 // surfaces the failure instead of hanging).
                 _ = p.waitForSequentialStartupSegments(timeout: 30.0)
             }
-            let body = buildMediaPlaylist()
+            let body = buildMediaPlaylist(generation: route.generation)
             stateLock.lock()
             let firstTime = !loggedMediaPlaylist
             if firstTime { loggedMediaPlaylist = true }
@@ -1140,7 +1174,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 return send404(fd: fd, path: normalizedPath, reason: "unparseable subtitle playlist path")
             }
             EngineLog.emit("[HLSLocalServer] subtitle rendition selected: subs_\(parsed.ordinal).m3u8 fetched", category: .hlsServer)
-            let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov)
+            let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov, generation: route.generation)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(subBody.utf8),
                            contentType: "application/vnd.apple.mpegurl")
@@ -1680,10 +1714,11 @@ final class HLSLocalServer: @unchecked Sendable {
                                              variant: variant)
     }
 
-    private func buildMediaPlaylist() -> String {
+    private func buildMediaPlaylist(generation: Int) -> String {
         guard let provider = provider else { return "#EXTM3U\n" }
         return Self.buildMediaPlaylistText(provider: provider,
-                                            subResourceBaseURL: subResourceBaseURL)
+                                            subResourceBaseURL: subResourceBaseURL,
+                                            generation: generation)
     }
 
     /// Parse ?_HLS_msn=N from the request query. _HLS_part ignored (segment-level blocking only, no partial segments). Returns nil for absent or unparseable (treated as plain reload).
@@ -1863,9 +1898,12 @@ final class HLSLocalServer: @unchecked Sendable {
     /// playlists stay consistent. AVPlayer fetches `subs_{ord}_{i}.vtt` around when it plays `seg{i}.mp4`, by
     /// which point the ~90s-ahead reader has that window's cues in the store. WebVTT segments carry no init
     /// segment, so no EXT-X-MAP.
-    static func buildSubtitleMediaPlaylistText(ordinal: Int, provider: HLSSegmentProvider) -> String {
+    static func buildSubtitleMediaPlaylistText(ordinal: Int, provider: HLSSegmentProvider,
+                                                generation: Int? = nil) -> String {
         let snapshot = provider.notePlaylistBuild()
-        let count = snapshot.visibleCount
+        let requestedGeneration = generation ?? provider.livePlaylistGeneration
+        let retiredEnd = provider.livePlaylistEndIndex(generation: requestedGeneration)
+        var count = min(snapshot.visibleCount, retiredEnd ?? snapshot.visibleCount)
         let firstVisible = min(snapshot.firstVisible, count)
 
         // Sodalite#32: whole-program shape, ONE VOD segment spanning the full duration, one .vtt with all cues.
@@ -1891,7 +1929,8 @@ final class HLSLocalServer: @unchecked Sendable {
         // AE#446 round 2: a rendition has to end with the video playlist it belongs to, or AVPlayer
         // keeps reloading a live subtitle track beside a finished asset.
         let liveOutage = (provider.playlistType == .live && !snapshot.endlistAdded
-                          && provider.liveOutageEndlist)
+                          && (retiredEnd != nil
+                              || provider.liveOutageEndlist))
         let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded && !liveOutage)
 
         var maxDuration: Double = 0
@@ -1906,10 +1945,16 @@ final class HLSLocalServer: @unchecked Sendable {
         // A rendition is a Media Playlist like any other, and it is built from this provider's own
         // segments, so the two values are the same number and may as well come from the same place.
         let targetDuration = (typeIsLive || liveOutage)
-            ? provider.liveTargetDurationSeconds(maxSegmentDuration: maxDuration)
+            ? provider.liveTargetDurationSeconds(maxSegmentDuration: maxDuration,
+                generation: requestedGeneration)
             : LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: maxDuration,
                                                    cutTargetSeconds: nil, cadenceFloorSeconds: nil)
 
+        if typeIsLive || liveOutage {
+            count = (firstVisible..<count).first {
+                !LiveTargetDurationSeal.accepts(provider.segmentDuration(at: $0), target: targetDuration)
+            } ?? count
+        }
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
@@ -1953,10 +1998,12 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     static func buildMediaPlaylistText(provider: HLSSegmentProvider,
-                                        subResourceBaseURL: URL? = nil) -> String {
+                                        subResourceBaseURL: URL? = nil, generation: Int? = nil) -> String {
         // Atomic snapshot from notePlaylistBuild(); a separate lock acquisition for visibleCount vs firstVisible let a concurrent window slide produce a trapping range.
         let snapshot = provider.notePlaylistBuild()
-        let count = snapshot.visibleCount
+        let requestedGeneration = generation ?? provider.livePlaylistGeneration
+        let retiredEnd = provider.livePlaylistEndIndex(generation: requestedGeneration)
+        var count = min(snapshot.visibleCount, retiredEnd ?? snapshot.visibleCount)
         let firstVisible = min(snapshot.firstVisible, count)
         let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
         // AE#446 round 2: a live source that has stopped delivering, with a consumer still holding
@@ -1964,7 +2011,8 @@ final class HLSLocalServer: @unchecked Sendable {
         // ENDLIST is the only thing measured to keep AVPlayer fetching a playlist whose tail has
         // stopped moving (a changed byte does not, and neither does a changed MEDIA-SEQUENCE).
         let liveOutage = (provider.playlistType == .live && !snapshot.endlistAdded
-                          && provider.liveOutageEndlist)
+                          && (retiredEnd != nil
+                              || provider.liveOutageEndlist))
         // Sliding live: no PLAYLIST-TYPE tag and no ENDLIST (EVENT forbids removal; VOD implies finished asset).
         let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded && !liveOutage)
 
@@ -1978,13 +2026,19 @@ final class HLSLocalServer: @unchecked Sendable {
             maxDuration = max(maxDuration, provider.segmentDuration(at: i))
         }
         let targetDuration = (typeIsLive || liveOutage)
-            ? provider.liveTargetDurationSeconds(maxSegmentDuration: maxDuration)
+            ? provider.liveTargetDurationSeconds(maxSegmentDuration: maxDuration,
+                generation: requestedGeneration)
             : LiveEdgePolicy.targetDurationSeconds(
                 maxSegmentDuration: maxDuration,
                 cutTargetSeconds: nil,
                 cadenceFloorSeconds: nil
             )
 
+        if typeIsLive || liveOutage {
+            count = (firstVisible..<count).first {
+                !LiveTargetDurationSeal.accepts(provider.segmentDuration(at: $0), target: targetDuration)
+            } ?? count
+        }
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
@@ -2008,7 +2062,7 @@ final class HLSLocalServer: @unchecked Sendable {
         // AE#446 round 5: the axis this build places the item on, stated where it is known exactly.
         // MEDIA-SEQUENCE above is the same fact addressed by index; this records the seconds it stands
         // for, and only an item's FIRST playlist decides (the latch is armed once per item attach).
-        if typeIsLive || liveOutage {
+        if (typeIsLive || liveOutage) && retiredEnd == nil {
             provider.noteServedLiveItemAxis(firstVisible: firstVisible)
         }
         if typeIsLive || liveOutage {

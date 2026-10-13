@@ -56,7 +56,7 @@ final class LiveProductionHaltTests: XCTestCase {
             reason: .segmentStall, sourceReopenable: true),
             "cutter wedge exits to host retune; the provider will never cut again")
         XCTAssertTrue(HLSVideoEngine.shouldHaltLiveProduction(
-            reason: .sourceReplay, sourceReopenable: true))
+            reason: .sourceReplay, sourceReopenable: false))
         XCTAssertTrue(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .eof, sourceReopenable: false),
             "host-provided custom-reader pump death delegates to host retune")
@@ -65,6 +65,9 @@ final class LiveProductionHaltTests: XCTestCase {
     }
 
     func testRecoverableExitsDoNotHaltLiveProduction() {
+        XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
+            reason: .sourceReplay, sourceReopenable: true),
+            "fresh source continues the retained cache and its exact-packet history")
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .eof, sourceReopenable: true),
             "reopenable exits (URL source, or #199 engine-created ingest reader with a fresh-reader factory) resume cutting into the same provider")

@@ -167,6 +167,7 @@ extension HLSVideoEngine {
         streamCopyAudio: HLSSegmentProducer.AudioConfig?,
         sourceAudioStreamIndex: Int32,
         sourceAudioStream: UnsafeMutablePointer<AVStream>?,
+        audioDemuxer: Demuxer,
         sourceCarriesAudio: Bool,
         audioHLSCodecs: inout String?,
         audioLanguage: String? = nil
@@ -280,11 +281,12 @@ extension HLSVideoEngine {
             )
         }
 
-        // #731: TrueHD Atmos with object rendering requested. Tried before the channel bridges, which it
-        // falls back to on any failure (see buildSpatialAudioProducerIfEligible).
+        // #731: TrueHD Atmos or DTS:X with object rendering requested. Tried before the channel bridges,
+        // which it falls back to on any failure (see buildSpatialAudioProducerIfEligible).
         if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
            let prod = buildSpatialAudioProducerIfEligible(
                audioStream: audioStream,
+               audioDemuxer: audioDemuxer,
                sourceAudioStreamIndex: sourceAudioStreamIndex,
                sourceCodecLabel: sourceCodecLabel,
                audioHLSCodecs: &audioHLSCodecs,

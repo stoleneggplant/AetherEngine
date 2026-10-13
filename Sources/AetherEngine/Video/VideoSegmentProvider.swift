@@ -694,6 +694,10 @@ struct LiveTargetDurationDerivation {
 }
 
 struct LiveTargetDurationSeal {
+    static func accepts(_ duration: Double, target: Int) -> Bool {
+        // Compare the EXTINF value actually serialized, including its millisecond rounding.
+        duration.isFinite && duration >= 0 && ((duration * 1_000).rounded() / 1_000).rounded() <= Double(target)
+    }
     private(set) var value: Int?
     private var didLogUpwardDrift = false
 
@@ -896,6 +900,33 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// RFC 8216 requires TARGETDURATION to stay constant for the lifetime of a media playlist.
     /// Guarded by stateLock and preserved across in-provider producer reopens.
     private var liveTargetDurationSeal = LiveTargetDurationSeal()
+    private var retiredLivePlaylists: [(targetDuration: Int, endIndex: Int)] = []
+    var onLivePlaylistRenewal: (@Sendable () -> Void)?
+
+    var livePlaylistGeneration: Int {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return retiredLivePlaylists.count
+    }
+
+    func livePlaylistEndIndex(generation: Int) -> Int? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return retiredLivePlaylists.indices.contains(generation) ? retiredLivePlaylists[generation].endIndex : nil
+    }
+
+    func liveTargetDurationSeconds(maxSegmentDuration: Double, generation: Int) -> Int {
+        let candidate = currentLiveTargetDuration(maxSegmentDuration: maxSegmentDuration)
+        stateLock.lock()
+        if retiredLivePlaylists.indices.contains(generation) {
+            let target = retiredLivePlaylists[generation].targetDuration
+            stateLock.unlock()
+            return target
+        }
+        let resolved = liveTargetDurationSeal.resolve(candidate: candidate.value)
+        stateLock.unlock()
+        if resolved.didSeal { EngineLog.emit("[HLSVideoEngine] \(candidate.account)", category: .session) }
+        return resolved.value
+    }
+
     /// AE#446: wall time of the newest finalized live segment, and the latch that says the source
     /// stopped delivering. See `liveDeliveryStalled`.
     private var _lastLiveSegmentFinalizedAt: Date?
@@ -1096,6 +1127,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Append a finalized live segment. Index must equal segments.count; out-of-order ignored.
     func appendLiveSegment(index: Int, startSeconds: Double, durationSeconds: Double,
                            discontinuous: Bool = false) {
+        let candidate = currentLiveTargetDuration(maxSegmentDuration: durationSeconds)
         stateLock.lock()
         guard index == segments.count else {
             stateLock.unlock()
@@ -1116,6 +1148,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             durationSeconds: durationSeconds,
             discontinuous: discontinuous
         ))
+        // A longer GOP cannot change an existing playlist's TARGETDURATION. Retire that
+        // URL and expose the same cache through a new, independently sealed playlist.
+        var renewPlaylist = false
+        if let sealed = liveTargetDurationSeal.value,
+           !LiveTargetDurationSeal.accepts(durationSeconds, target: sealed) {
+            retiredLivePlaylists.append((targetDuration: sealed, endIndex: index))
+            liveTargetDurationSeal = LiveTargetDurationSeal()
+            _ = liveTargetDurationSeal.resolve(candidate: candidate.value)
+            renewPlaylist = true
+        }
         let finalizedAt = Date()
         if let last = _lastLiveSegmentFinalizedAt {
             _liveDeliveryCadence.note(intervalSeconds: finalizedAt.timeIntervalSince(last))
@@ -1130,6 +1172,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         firstSegmentCondition.broadcast()
         firstSegmentCondition.unlock()
         applyNativeLiveDVRRetention()
+        if renewPlaylist {
+            EngineLog.emit("[HLSVideoEngine] live playlist renewed: generation=\(livePlaylistGeneration) target=\(candidate.value)s segment=\(index) duration=\(durationSeconds)s; retaining source and cache", category: .session)
+            onLivePlaylistRenewal?()
+        }
     }
 
     /// Append the real duration of a finalized sequential-VOD segment (index-contiguous from 0;
@@ -2543,6 +2589,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         cancelWaiters()
     }
+
+    /// A host-authorized source retry continues this same cache and playlist.
+    func resumeLiveProduction() {
+        stateLock.lock()
+        _liveProductionHalted = false
+        stateLock.unlock()
+    }
     var liveTargetDurationFloorSeconds: Double? {
         // The floor tracks observed cadence regardless of the gate override: patience must cover the real
         // inter-batch gap even when a host forces blocking-reload on/off (#167).
@@ -2714,7 +2767,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             }
             // AE#684 latched ingest sessions; AE#686 extends it to a source the engine cuts itself,
             // where the second grace bought nothing on device but a session 1 s further from the edge.
-            if firstManifestServed, liveCadencePolicy != nil || firstServeLatchCoversEngineCut {
+            if firstManifestServed, liveCadencePolicy != nil || firstServeLatchCoversEngineCut || livePlaylistGeneration > 0 {
                 accountForRepeatServe(since: enteredAt, note: "first-serve latch")
                 return true
             }
