@@ -18,7 +18,8 @@ enum TinyTransportStreamFixture {
     /// The stream as a live source serves it: from byte 0 to its end, then EOF, with no length and
     /// no disc probe (a disc probe reads ahead, and a live open does not rewind after it).
     final class LiveReader: IOReader, @unchecked Sendable {
-        private let bytes = TinyTransportStreamFixture.data
+        private let bytes: Data
+        init(bytes: Data = TinyTransportStreamFixture.data) { self.bytes = bytes }
         private let lock = NSLock()
         private var position = 0
 

@@ -123,9 +123,15 @@ struct BoundedFetchTests {
         // Measured against `session.data(for:)` on the same origin in the same run, not against a wall
         // clock: a loaded suite stretched an absolute sample to 8 s, while the per-byte accumulation this
         // replaced ran about 27x slower than the plain fetch under any load (audit NET-113).
+        //
+        // Sampled until the bound holds rather than a fixed three times. A loaded suite stalls either
+        // fetch for up to 2.7 s against 16 ms unloaded, and all three bounded samples once landed in a
+        // stall. A stall only ever adds time, so the best sample converges on the real cost, and the
+        // per-byte path is slower in every sample and can never pass.
+        let bound = { (plain: Duration) in plain * 4 + .milliseconds(250) }
         var bestPlain = Duration.seconds(3600)
         var bestBounded = Duration.seconds(3600)
-        for _ in 0..<3 {
+        for _ in 0..<12 {
             let plainStart = ContinuousClock.now
             let (plain, _) = try await session.data(for: request(origin))
             bestPlain = min(bestPlain, ContinuousClock.now - plainStart)
@@ -134,8 +140,9 @@ struct BoundedFetchTests {
             let (data, _) = try await BoundedPlaylistFetch.data(for: request(origin), session: session, limit: 64 * 1024 * 1024)
             bestBounded = min(bestBounded, ContinuousClock.now - boundedStart)
             #expect(data.count == size)
+            if bestBounded < bound(bestPlain) { break }
         }
-        #expect(bestBounded < bestPlain * 4 + .milliseconds(250), "bounded \(bestBounded) vs plain \(bestPlain)")
+        #expect(bestBounded < bound(bestPlain), "bounded \(bestBounded) vs plain \(bestPlain)")
     }
 
     @Test("a segment may weigh 20 MB/s of its own duration between 32 MiB and 256 MiB")

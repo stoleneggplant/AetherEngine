@@ -35,7 +35,7 @@ enum SourcePrewarmFetcher {
     private static let session: URLSession = URLSession(
         configuration: AVIOReader.makeSessionConfig(),
         delegate: EngineTLS.sessionDelegate,
-        delegateQueue: nil)
+        delegateQueue: AVIOReader.makePlaybackDelegateQueue())
 
     /// One warm at a time, process-wide.
     ///

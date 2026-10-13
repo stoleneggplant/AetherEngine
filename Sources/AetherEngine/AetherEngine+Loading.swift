@@ -323,11 +323,28 @@ extension AetherEngine {
     /// which is the point, since re-creating it is what breaks AVKit's MediaRemote registration.
     func makeNativeHost() -> NativeAVPlayerHost {
         #if os(tvOS) || os(iOS)
-        return NativeAVPlayerHost(ownsNowPlayingSession: Self.ownsNowPlaying(
+        let host = NativeAVPlayerHost(ownsNowPlayingSession: Self.ownsNowPlaying(
             hostOptIn: ownsVideoNowPlayingSession, role: loadedOptions.sharedOutputRole))
         #else
-        return NativeAVPlayerHost()
+        let host = NativeAVPlayerHost()
         #endif
+        host.pictureInPictureActive = pictureInPictureActive
+        host.onVideoPresentationRecovery = { [weak self, weak host] action, position in
+            guard let self, let host, self.nativeHost === host,
+                  self.state == .playing, !self.pictureInPictureActive,
+                  self.pendingRecoverySeekClockTarget == nil,
+                  !self.liveItemPlacementPending else { return }
+            switch action {
+            case .nudge:
+                self.reengageStalledConsumer(position: position, trigger: "video presentation")
+            case .reload:
+                // A live native URL with no retained session cannot promise this placement.
+                guard !self.isLive || self.nativeVideoSession != nil else { return }
+                self.reloadStalledConsumerItem(position: position,
+                    preserveLivePosition: self.isLive ? self.currentTime : nil)
+            }
+        }
+        return host
     }
 
     /// Replay the staged Now-Playing identity onto a host, and re-assert session ownership. The
@@ -1038,6 +1055,39 @@ extension AetherEngine {
                 // Cap inside appendSeam; losing the oldest only reduces fidelity for DVR positions past 60+ program boundaries.
                 map.appendSeam(shiftSeconds: seconds, activatingAtItemSeconds: seamOutputSeconds)
                 self.setPresentationAxis(map)
+            }
+        }
+        session.onLiveSourceReopening = { [weak self, weak session] in
+            self?.hop(for: generation) { [weak self, weak session] in
+                guard let self, let session, self.nativeVideoSession === session else { return }
+                self.endRecordingIfRunning(reason: .sourceReset)
+            }
+        }
+        // Unset, the session reports the exhaustion through `onLiveSourceReset`: a host that never
+        // subscribed to `liveSourceReplayExhausted` would otherwise hold the last frame for good.
+        if loadedOptions.hostRetriesExhaustedLiveReplay {
+            session.onLiveSourceReplayExhausted = { [weak self, weak session] in
+                self?.hop(for: generation) { [weak self, weak session] in
+                    guard let self, let session, self.nativeVideoSession === session else { return }
+                    self.noteLiveSourceGivenUp()
+                    self.endRecordingIfRunning(reason: .sourceReset)
+                    self.liveSourceReplayExhausted.send()
+                }
+            }
+        }
+        session.onLivePlaylistRenewal = { [weak self, weak session] in
+            self?.hop(for: generation) { [weak self, weak session] in
+                guard let self, let session, self.nativeVideoSession === session,
+                      let oldURL = (self.currentAVPlayer?.currentItem?.asset as? AVURLAsset)?.url,
+                      let url = session.renewedLivePlaylistURL(replacing: oldURL), url != oldURL else { return }
+                self.stallReengageTask?.cancel()
+                self.stallReengageTask = nil
+                self.liveOutageResumeWatcher?.cancel()
+                self.liveOutageResumeWatcher = nil
+                session.clearLiveOutageEndlist()
+                self.reloadStalledConsumerItem(position: self.renderedPositionMirror.get(),
+                    allowPausedConsumer: true, liveRejoinOverride: self.currentTime,
+                    replacementURL: url)
             }
         }
         session.onLiveSourceReset = { [weak self, weak session] in
@@ -1820,7 +1870,9 @@ extension AetherEngine {
                       // AE#520: the session knows whether the bitstream it stream-copied carries JOC;
                       // the HDMI route cannot, because Atmos passthrough and a stereo LPCM route
                       // report the same two channels.
-                      audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true))
+                      audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true,
+                      nativeVideoFrameDiagnostics: loadedOptions.nativeVideoFrameDiagnostics,
+                      nativeVideoFrameRecovery: loadedOptions.nativeVideoFrameRecovery))
         forceNativeLegibleDeselectedUntilHostSelects()
         // Sodalite#175: from the session's own pick, since a track-switch reload has no active index yet.
         let sessionAudioPick = nativeVideoSession.map(\.activeAudioSourceStreamIndex).flatMap { $0 >= 0 ? Int($0) : nil }

@@ -79,7 +79,9 @@ final class ObjectAudioRenderer {
         rampTotal = rampRemaining
         hasMetadata = Array(repeating: false, count: roles.count)
         // Beds and LFE have gains the moment the renderer exists; objects wait for metadata and are
-        // silent until their first update, rather than guessing at a position.
+        // silent until their first update, rather than guessing at a position. The TrueHD decoder
+        // holds the blocks before that update and gives the first of them its state at frame 0
+        // (`ObjectMetadataHold`), so after a reset that wait costs nothing audible.
         for (index, role) in roles.enumerated() where role != .object {
             staticGains(for: role, state: ObjectAudioElementState(), into: &current[index])
             target[index] = current[index]
@@ -209,8 +211,9 @@ final class ObjectAudioRenderer {
 
     /// Where a speaker-anchored bed channel the layout lacks goes when panning it would be wrong. A
     /// 7.1 bed's side and rear surrounds both belong on a 5.1 layout's surround pair, the way a 7.1 to
-    /// 5.1 downmix folds them; panned by position, a side surround halfway down the wall would put
-    /// half its power in the front speakers.
+    /// 5.1 downmix folds them, and a 5.1 bed's surrounds on a 7.1 layout's sides, which sit where
+    /// TS 103 448 puts the 5.1 surrounds. Panned by position, a 5.1 surround would split between a
+    /// 7.1 layout's sides and rears.
     static func downmixTarget(_ speaker: SpatialSpeaker, in layout: SpatialSpeakerLayout) -> Int? {
         let speakers = layout.speakers
         switch speaker {

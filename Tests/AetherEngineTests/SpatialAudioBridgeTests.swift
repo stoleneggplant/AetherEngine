@@ -155,6 +155,23 @@ struct SpatialAudioBridgeTests {
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == nil)
     }
 
+    @Test("every 48 kHz DTS-HD MA track is a DTS:X candidate, whatever FFmpeg's label; lossy DTS is not")
+    func dtsEligibility() {
+        let on = ObjectAudioRendering.apac(.l714)
+        // FFmpeg names only two of DTS:X's markers, so a plain DTS-HD MA label can still be DTS:X;
+        // LibDTSX decides on the track's first frames.
+        for profile in [AV_PROFILE_DTS_HD_MA, AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
+            #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)
+        }
+        for profile in [AV_PROFILE_DTS, AV_PROFILE_DTS_ES, AV_PROFILE_DTS_HD_HRA, AV_PROFILE_DTS_EXPRESS] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == nil)
+        }
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 96_000) == nil)
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 48_000) == nil)
+        #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_TRUEHD, profile: 30) == .trueHDAtmos)
+    }
+
     @Test("the first packet sits at the source position of the first decodable frame, and steps by 1024")
     func anchorsOnSource() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -289,6 +306,48 @@ struct SpatialAudioBridgeTests {
         #expect(!a.isEmpty)
         #expect(a.map(\.pts) == b.map(\.pts))
         #expect(a.map(\.data) == b.map(\.data))
+    }
+
+    /// Like `ClickDecoder`, but returns nothing after a reset until the bridge asks for what it
+    /// holds, as the TrueHD decoder does while it waits for the first object metadata.
+    final class HoldingDecoder: ObjectAudioDecoding {
+        private let inner = ClickDecoder(clickFrame: 30_000)
+        private var holding = true
+        private(set) var releases = 0
+
+        func push(_ bytes: UnsafeRawBufferPointer) throws { try inner.push(bytes) }
+        func nextBlock() throws -> ObjectAudioDecodedBlock? { holding ? nil : try inner.nextBlock() }
+        func reset() { inner.reset(); holding = true }
+        func releaseHeldBlocks() { releases += 1; holding = false }
+    }
+
+    /// A cut settles the bridge, and what the decoder holds plays before that cut, so the hold moves
+    /// no audio into the next segment.
+    @Test("a cut releases what the decoder holds, so it splits as a decoder without a hold does")
+    func settleReleasesHeldBlocks() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let holding = HoldingDecoder()
+        let held = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: holding)
+        let plain = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        defer { held.close(); plain.close() }
+        func take(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [(pts: Int64, data: Data)] {
+            packets.map { fp in
+                defer { var p: UnsafeMutablePointer<AVPacket>? = fp; trackedPacketFree(&p) }
+                return (fp.pointee.pts, Data(bytes: fp.pointee.data, count: Int(fp.pointee.size)))
+            }
+        }
+        var a = try feed(held, startMs: 0, count: 25).map(\.pts)
+        var b = try feed(plain, startMs: 0, count: 25).map(\.pts)
+        a += take(held.settle()).map(\.pts)
+        b += take(plain.settle()).map(\.pts)
+        #expect(!b.isEmpty)
+        #expect(a == b, "after the cut both carry the same packets")
+        #expect(holding.releases == 1)
+        a += try feed(held, startMs: 500, count: 25).map(\.pts) + take(held.flush()).map(\.pts)
+        b += try feed(plain, startMs: 500, count: 25).map(\.pts) + take(plain.flush()).map(\.pts)
+        #expect(a == b)
     }
 
     @Test("a producer restart re-anchors on the new position")
