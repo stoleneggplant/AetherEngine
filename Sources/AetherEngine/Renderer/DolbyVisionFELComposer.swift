@@ -8,11 +8,12 @@ import Metal
 /// P010 (`x420`) buffer that `AVSampleBufferDisplayLayer` presents directly. No re-encode: the buffer
 /// is the picture.
 ///
-/// One thread per 2x2 luma block, i.e. per chroma sample. Chroma prediction reads the block's mean
-/// luma, which is where a 4:2:0 chroma sample sits. An enhancement layer coarser than the base (a
-/// 1080p FEL under a 2160p base) is brought up by dequantizing its four nearest samples and
-/// interpolating the residuals bilinearly, so the dead zone around the NLQ offset is never smeared
-/// into a step; at equal sizes that is the sample itself.
+/// One thread per 2x2 luma block, i.e. per chroma sample: the composition runs at 4:2:0, which is what
+/// every Profile 7 RPU declares (`mapping_chroma_format_idc` 0, DM `signal_chroma_format` 0) and what
+/// DoViBaker composes at. The resampling follows DoViBaker (AE#702): chroma prediction reads luma
+/// through a [1 2 1] filter across the left-sited luma column, and a quarter-resolution enhancement
+/// layer is brought to size by its separable 2x upscale (a 4-tap luma filter, copy / spline16 for
+/// chroma) BEFORE the NLQ dequantization, in integer codes with its rounding.
 final class DolbyVisionFELComposer: @unchecked Sendable {
 
     /// The composed buffers' pixel format: 10-bit 4:2:0 biplanar, video range, the format VideoToolbox
@@ -213,24 +214,67 @@ final class DolbyVisionFELComposer: @unchecked Sendable {
         return v10 * 64.0 / 65535.0;
     }
 
-    // Residual at a base-layer position, from an enhancement plane of any size: the four nearest
-    // enhancement samples are dequantized and the residuals interpolated.
-    inline float residualAt(constant float *P, int c, texture2d<float, access::read> el, int channel,
-                            float2 pos, float2 dstSize) {
-        float2 elSize = float2(el.get_width(), el.get_height());
-        float2 e = (pos + 0.5) * elSize / dstSize - 0.5;
-        float2 f = e - floor(e);
-        int2 i0 = int2(floor(e));
-        int2 maxI = int2(elSize) - 1;
-        int2 a = clamp(i0, int2(0), maxI);
-        int2 b = clamp(i0 + int2(1, 0), int2(0), maxI);
-        int2 cc = clamp(i0 + int2(0, 1), int2(0), maxI);
-        int2 d = clamp(i0 + int2(1, 1), int2(0), maxI);
-        float r00 = residual(P, c, el.read(uint2(a))[channel] * CODE);
-        float r10 = residual(P, c, el.read(uint2(b))[channel] * CODE);
-        float r01 = residual(P, c, el.read(uint2(cc))[channel] * CODE);
-        float r11 = residual(P, c, el.read(uint2(d))[channel] * CODE);
-        return mix(mix(r00, r10, f.x), mix(r01, r11, f.x), f.y);
+    // A 10-bit code from a P010 plane, read at a clamped position.
+    inline int codeAt(texture2d<float, access::read> t, int channel, int x, int y) {
+        int2 limit = int2(t.get_width(), t.get_height()) - 1;
+        return int(rint(t.read(uint2(clamp(int2(x, y), int2(0), limit)))[channel] * CODE));
+    }
+
+    // DolbyVisionComposerParams.taps: one 2x step of DoViBaker's enhancement-layer upscaling.
+    struct Taps { int start; int4 w; int shift; int round_; };
+    inline Taps tapsFor(bool luma, bool odd) {
+        Taps t;
+        if (luma) {
+            t.start = odd ? -1 : -2;
+            t.w = odd ? int4(-9, 111, 29, -3) : int4(-3, 29, 111, -9);
+            t.shift = 7; t.round_ = 64;
+        } else if (odd) {
+            t.start = -1; t.w = int4(-307, 2355, 2355, -307); t.shift = 12; t.round_ = 2048;
+        } else {
+            t.start = 0; t.w = int4(1, 0, 0, 0); t.shift = 0; t.round_ = 0;
+        }
+        return t;
+    }
+
+    // Vertical pass at one enhancement column, rounded and clipped like DoViBaker's intermediate frame.
+    inline int upVertical(texture2d<float, access::read> el, int channel, int col, int outY, bool luma) {
+        Taps t = tapsFor(luma, (outY & 1) != 0);
+        int m = outY >> 1;
+        int acc = t.round_;
+        for (int k = 0; k < 4; k++) { acc += t.w[k] * codeAt(el, channel, col, m + t.start + k); }
+        return clamp(acc >> t.shift, 0, 65535);
+    }
+
+    // DolbyVisionComposerParams.upsample2x(plane:...): vertical first, then horizontal.
+    inline int upsampled(texture2d<float, access::read> el, int channel, int outX, int outY, bool luma) {
+        Taps t = tapsFor(luma, (outX & 1) != 0);
+        int m = outX >> 1;
+        int lastCol = int(el.get_width()) - 1;
+        int acc = t.round_;
+        for (int k = 0; k < 4; k++) {
+            int col = clamp(m + t.start + k, 0, lastCol);
+            acc += t.w[k] * upVertical(el, channel, col, outY, luma);
+        }
+        return clamp(acc >> t.shift, 0, 65535);
+    }
+
+    // The enhancement-layer code at an output position: DoViBaker's 2x upscale for a quarter-resolution
+    // layer, the sample itself at equal size, the nearest sample for any other ratio.
+    inline int enhancementCode(texture2d<float, access::read> el, int channel, int2 p, int2 dst, bool luma) {
+        int2 es = int2(el.get_width(), el.get_height());
+        if (all(es * 2 == dst)) { return upsampled(el, channel, p.x, p.y, luma); }
+        if (all(es == dst)) { return codeAt(el, channel, p.x, p.y); }
+        return codeAt(el, channel, p.x * es.x / dst.x, p.y * es.y / dst.y);
+    }
+
+    // DolbyVisionComposerParams.mmrLuma: [1 2 1] across the left-sited luma column of one row.
+    inline int mmrLine(texture2d<float, access::read> blY, int row, int cx, int cw) {
+        if (cx == 0) { return (3 * codeAt(blY, 0, 0, row) + codeAt(blY, 0, 1, row) + 2) >> 2; }
+        if (cx == cw - 1) {
+            return (codeAt(blY, 0, 2 * cx - 1, row) + 3 * codeAt(blY, 0, 2 * cx, row) + 2) >> 2;
+        }
+        return (codeAt(blY, 0, 2 * cx - 1, row) + 2 * codeAt(blY, 0, 2 * cx, row)
+                + codeAt(blY, 0, 2 * cx + 1, row) + 2) >> 2;
     }
 
     kernel void doviFELCompose(texture2d<float, access::read> blY [[texture(0)]],
@@ -241,42 +285,40 @@ final class DolbyVisionFELComposer: @unchecked Sendable {
                                texture2d<float, access::write> outC [[texture(5)]],
                                constant float *P [[buffer(0)]],
                                uint2 gid [[thread_position_in_grid]]) {
-        uint cw = outC.get_width();
-        uint ch = outC.get_height();
-        if (gid.x >= cw || gid.y >= ch) { return; }
-        uint w = outY.get_width();
-        uint h = outY.get_height();
+        int cw = int(outC.get_width());
+        int ch = int(outC.get_height());
+        int cx = int(gid.x), cy = int(gid.y);
+        if (cx >= cw || cy >= ch) { return; }
+        int w = int(outY.get_width());
+        int h = int(outY.get_height());
         bool addResidual = P[0] > 0.5;
 
-        float2 cbcr = blC.read(gid).rg * CODE / BL_MAX;
-        float ys[4];
-        uint2 lp[4];
-        float ysum = 0.0;
-        for (int i = 0; i < 4; i++) {
-            lp[i] = uint2(min(gid.x * 2 + uint(i & 1), w - 1), min(gid.y * 2 + uint(i >> 1), h - 1));
-            ys[i] = blY.read(lp[i]).r * CODE / BL_MAX;
-            ysum += ys[i];
-        }
-        float ymean = ysum * 0.25;
+        float cb0 = float(codeAt(blC, 0, cx, cy)) / BL_MAX;
+        float cr0 = float(codeAt(blC, 1, cx, cy)) / BL_MAX;
+        int row0 = min(2 * cy, h - 1);
+        int row1 = min(2 * cy + 1, h - 1);
+        float mmrY = float((mmrLine(blY, row0, cx, cw) + mmrLine(blY, row1, cx, cw) + 1) >> 1) / BL_MAX;
 
-        float2 cDst = float2(cw, ch);
-        float cb = predict(P, 1, ymean, cbcr.x, cbcr.y);
-        float cr = predict(P, 2, ymean, cbcr.x, cbcr.y);
+        int2 cDst = int2(cw, ch);
+        float cb = predict(P, 1, mmrY, cb0, cr0);
+        float cr = predict(P, 2, mmrY, cb0, cr0);
         if (addResidual) {
-            cb += residualAt(P, 1, elC, 0, float2(gid), cDst);
-            cr += residualAt(P, 2, elC, 1, float2(gid), cDst);
+            cb += residual(P, 1, float(enhancementCode(elC, 0, int2(cx, cy), cDst, false)));
+            cr += residual(P, 2, float(enhancementCode(elC, 1, int2(cx, cy), cDst, false)));
         }
         // The chroma plane's dither pattern is shifted off the luma one so the two do not correlate.
         uint2 cp = gid + uint2(3, 5);
         outC.write(float4(requantize(cb, cp), requantize(cr, cp), 0.0, 1.0), gid);
 
-        float2 yDst = float2(w, h);
+        int2 yDst = int2(w, h);
         for (int i = 0; i < 4; i++) {
-            float y = predict(P, 0, ys[i], cbcr.x, cbcr.y);
+            int2 lp = int2(min(2 * cx + (i & 1), w - 1), min(2 * cy + (i >> 1), h - 1));
+            float ys = float(codeAt(blY, 0, lp.x, lp.y)) / BL_MAX;
+            float y = predict(P, 0, ys, cb0, cr0);
             if (addResidual) {
-                y += residualAt(P, 0, elY, 0, float2(lp[i]), yDst);
+                y += residual(P, 0, float(enhancementCode(elY, 0, lp, yDst, true)));
             }
-            outY.write(float4(requantize(y, lp[i]), 0.0, 0.0, 1.0), lp[i]);
+            outY.write(float4(requantize(y, uint2(lp)), 0.0, 0.0, 1.0), uint2(lp));
         }
     }
     """

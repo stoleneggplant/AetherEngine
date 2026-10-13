@@ -5165,14 +5165,16 @@ public final class AetherEngine: ObservableObject {
                 enhancementLayerType: nil,
                 displayPresentsDolbyVision: sessionDisplayCaps.supportsDolbyVision,
                 presentsBaseLayerOnly: presentsDolbyVisionBaseLayer,
-                hostAllowsComposition: options.composesDolbyVisionEnhancementLayer,
+                hostAllowsComposition: options.preferDualLayerDolbyVision,
                 isLive: options.isLive,
                 sourceIsSeekable: probe.isSourceSeekable,
                 samplesAreLengthPrefixed: framing == .lengthPrefixed(size: 4),
                 hardwareCanCompose: false)
-            if DolbyVisionFELPolicy.worthAuditing(felInputs), case .url(let felURL) = source {
-                felInputs.hardwareCanCompose = DolbyVisionFELDecoder.deviceCanCompose
-                if felInputs.hardwareCanCompose {
+            var shortfall: String?
+            if DolbyVisionFELPolicy.worthAuditing(felInputs) {
+                shortfall = DolbyVisionFELDecoder.deviceShortfall()
+                felInputs.hardwareCanCompose = shortfall == nil
+                if felInputs.hardwareCanCompose, case .url(let felURL) = source {
                     let felHeaders = options.httpHeaders
                     felInputs.enhancementLayerType = await BlockingWork.detached(priority: .userInitiated) {
                         DolbyVisionRecordAudit.enhancementLayerTypeOfSource(url: felURL, extraHeaders: felHeaders)
@@ -5184,14 +5186,17 @@ public final class AetherEngine: ObservableObject {
                     }
                 }
                 composesFEL = DolbyVisionFELPolicy.composes(felInputs)
+            }
+            // AE#702: a host that opted in gets one line saying which way a Profile 7 went, and why.
+            if options.preferDualLayerDolbyVision, felInputs.dvProfile == 7 {
                 EngineLog.emit(
                     composesFEL
-                        ? "[AetherEngine] DV Profile 7 FEL on a Dolby Vision display: composing base + "
+                        ? "[AetherEngine] AE#702: DV Profile 7 FEL on a Dolby Vision display: composing base + "
                           + "enhancement layers on the software host (VideoToolbox decode, Metal composition, "
                           + "P010 with per-frame Profile 8.1 metadata)"
-                        : "[AetherEngine] DV Profile 7 keeps the single-layer 8.1 conversion: enhancement layer "
-                          + (felInputs.enhancementLayerType ?? "unread")
-                          + (felInputs.hardwareCanCompose ? "" : ", no Metal GPU or hardware HEVC decode"),
+                        : "[AetherEngine] AE#702: dual-layer Dolby Vision requested, keeping the single-layer 8.1 "
+                          + "conversion: "
+                          + (DolbyVisionFELPolicy.refusal(felInputs, hardwareShortfall: shortfall) ?? "unknown"),
                     category: .engine)
             }
             if composesFEL { useSoftwarePath = true }

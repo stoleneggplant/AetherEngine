@@ -12,20 +12,26 @@ the public-API contract.
 
 ### Added
 
-- **Dolby Vision Profile 7 FEL plays dual-layer.** The Profile 7 to 8.1 conversion keeps the RPU and
-  discards the enhancement layer, which for a Full Enhancement Layer loses the residual the picture was
-  mastered with. Where the display presents Dolby Vision and the device has a Metal GPU and hardware
-  HEVC decode, a seekable VOD Profile 7 whose first RPU names FEL now runs on the software host:
-  VideoToolbox decodes the base layer (as Profile 8.1, so its pictures carry per-frame Dolby Vision
-  metadata) and the unwrapped enhancement layer, the pictures are paired by presentation time, a Metal
-  kernel rebuilds the 12-bit signal from the RPU's reshaping curves and NLQ residual, and the result is
-  requantized to 10-bit P010 with an ordered dither and presented through `AVSampleBufferDisplayLayer`
-  with the base picture's metadata, the panel asked for `dvh1` through `AVDisplayManager` as before. No
-  re-encode. `dolbyVisionConversion` reads the new `.profile7FELComposedToProfile81`. MEL sources,
-  devices and displays without the requirements, and `LoadOptions.composesDolbyVisionEnhancementLayer
-  = false` keep the single-layer conversion; any composition failure presents the base picture, which is
-  what the conversion showed. The software host keeps its usual costs (picture on the device only, no
-  Atmos passthrough), which is why the option exists.
+- **Dolby Vision Profile 7 FEL can play dual-layer (opt-in, AE#702).** The Profile 7 to 8.1 conversion
+  keeps the RPU and discards the enhancement layer, which for a Full Enhancement Layer loses the
+  residual the picture was mastered with. With `LoadOptions.preferDualLayerDolbyVision = true`, a display
+  presenting Dolby Vision, and a device with a Metal GPU and hardware HEVC and Dolby Vision decode, a
+  seekable VOD Profile 7 whose first RPU names FEL runs on the software host instead. VideoToolbox
+  decodes the base layer (as Profile 8.1, so its pictures carry the frame's Dolby Vision attachments) and
+  the unwrapped enhancement layer, the pictures are paired by presentation time, and a Metal kernel
+  rebuilds the 12-bit 4:2:0 signal: the RPU's polynomial / MMR prediction (the chroma MMR reading luma
+  through DoViBaker's left-sited [1 2 1] filter), plus the NLQ residual of the enhancement layer, which a
+  quarter-resolution layer reaches through DoViBaker's separable 2x upsampling before it is dequantized.
+  The result is requantized to 10-bit P010 with an ordered dither and presented through
+  `AVSampleBufferDisplayLayer` carrying the base picture's `DolbyVisionRPUData` and
+  `DolbyCompatibilityID` attachments (undocumented, kept in `DolbyVisionUndocumentedKeys`); the panel is
+  asked for `dvh1` through `AVDisplayManager` as before. No re-encode. `dolbyVisionConversion` reads the
+  new `.profile7FELComposedToProfile81`. The default, MEL sources, and devices and displays without the
+  requirements keep the single-layer conversion, and the log names the reason in one line. A frame the
+  composer cannot build presents the base picture, which is what the conversion showed, and a dual-layer
+  decoder that cannot open falls back to the single-layer VideoToolbox decoder instead of failing the
+  load. The software host keeps its usual costs (picture on the device only, no Atmos passthrough),
+  which is why the route is opt-in.
 
 ### Fixed
 

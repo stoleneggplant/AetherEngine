@@ -116,6 +116,63 @@ struct DolbyVisionComposerParams: Equatable, Sendable {
         return ((v & 1) << 5) | ((u & 1) << 4) | ((v & 2) << 2) | ((u & 2) << 1) | ((v & 4) >> 1) | ((u & 4) >> 2)
     }
 
+    // MARK: - Resampling (DoViBaker's, mirrored by the Metal kernel)
+
+    /// The base-layer luma a 4:2:0 chroma sample's MMR prediction reads (AE#702, from DoViBaker's
+    /// `applyDovi`): each of the chroma sample's two luma rows filtered [1 2 1] / 4 around the left-sited
+    /// luma column `2 * cx`, with (3 1) and (1 3) at the first and last chroma column, then the two rows
+    /// averaged, all in integer base-layer codes with DoViBaker's rounding. `row0` / `row1` read a luma
+    /// code by column and clamp it themselves.
+    static func mmrLuma(row0: (Int) -> Int, row1: (Int) -> Int, chromaColumn cx: Int, chromaWidth cw: Int) -> Int {
+        func line(_ y: (Int) -> Int) -> Int {
+            if cx == 0 { return (3 * y(0) + y(1) + 2) >> 2 }
+            if cx == cw - 1 { return (y(2 * cx - 1) + 3 * y(2 * cx) + 2) >> 2 }
+            return (y(2 * cx - 1) + 2 * y(2 * cx) + y(2 * cx + 1) + 2) >> 2
+        }
+        return (line(row0) + line(row1) + 1) >> 1
+    }
+
+    /// Which of DoViBaker's two enhancement-layer upsamplers a plane takes.
+    enum UpsampleKind: Sendable {
+        /// 4-tap, (-3 29 111 -9) / 128 for even outputs and its mirror for odd ones.
+        case luma
+        /// Even outputs copy the sample (top-left chroma siting); odd ones are spline16 at the midpoint,
+        /// (-307 2355 2355 -307) / 4096.
+        case chroma
+    }
+
+    /// The taps of one 2x upsampling step: the first source offset relative to `output >> 1`, the four
+    /// weights, the shift and its rounding term. Shared with the kernel's `tapsFor`.
+    static func taps(_ kind: UpsampleKind, odd: Bool) -> (start: Int, weights: [Int], shift: Int, round: Int) {
+        switch (kind, odd) {
+        case (.luma, false):   return (-2, [-3, 29, 111, -9], 7, 64)
+        case (.luma, true):    return (-1, [-9, 111, 29, -3], 7, 64)
+        case (.chroma, false): return (0, [1, 0, 0, 0], 0, 0)
+        case (.chroma, true):  return (-1, [-307, 2355, 2355, -307], 12, 2048)
+        }
+    }
+
+    /// One 2x step along a line of `count` samples: output index `output`, source indices clamped to the
+    /// line as DoViBaker clamps them, result clipped to 16 bits as its intermediate frame is.
+    static func upsample2x(_ sample: (Int) -> Int, count: Int, output: Int, kind: UpsampleKind) -> Int {
+        let t = taps(kind, odd: output & 1 == 1)
+        let m = output >> 1
+        var acc = t.round
+        for k in 0..<4 {
+            acc += t.weights[k] * sample(min(max(m + t.start + k, 0), count - 1))
+        }
+        return min(max(acc >> t.shift, 0), 0xFFFF)
+    }
+
+    /// DoViBaker's enhancement-layer upscale of a quarter-resolution plane, at one output sample:
+    /// vertical first into a rounded, clipped intermediate, then horizontal. `plane(x, y)` reads a code.
+    static func upsample2x(plane: (Int, Int) -> Int, width: Int, height: Int, x: Int, y: Int,
+                           kind: UpsampleKind) -> Int {
+        upsample2x({ col in
+            upsample2x({ row in plane(col, row) }, count: height, output: y, kind: kind)
+        }, count: width, output: x, kind: kind)
+    }
+
     // MARK: - GPU layout
 
     /// Floats per component in `packed()`; offsets below are within one component's block.

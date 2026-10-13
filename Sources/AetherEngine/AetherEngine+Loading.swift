@@ -2063,6 +2063,9 @@ extension AetherEngine {
             host.stop()
             try checkLoadCurrent(generation)
         }
+        // The host clears its flag when the dual-layer decoder could not open and it fell back to the base
+        // layer; that session, and every rebuild of it, is not a composed one.
+        sourceComposesDolbyVisionFEL = sourceComposesDolbyVisionFEL && host.composesDolbyVisionFEL
         if sourceComposesDolbyVisionFEL {
             dolbyVisionConversion = .profile7FELComposedToProfile81
         }

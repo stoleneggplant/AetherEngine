@@ -969,7 +969,7 @@ final class SoftwarePlaybackHost {
         // Applied here (not init) so it also covers a decoder replaced above.
         (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
 
-        try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
+        let frameHandler: DecodedFrameHandler = { [weak self] pixelBuffer, pts, hdr10PlusData in
             guard let self else { return }
             // AE#491: a frame decoded from a pre-seek packet is not late, it is from somewhere else.
             guard self.decodeGeneration == self.seekGeneration else { return }
@@ -993,6 +993,31 @@ final class SoftwarePlaybackHost {
                     category: .swPlayback
                 )
             }
+        }
+        do {
+            try videoDecoder.open(stream: vStream, onFrame: frameHandler)
+        } catch let felError where videoDecoder is DolbyVisionFELDecoder {
+            // The dual-layer decoder could not open (VideoToolbox refused both its `dvh1` and its `hvc1`
+            // session). Falling back costs the session its Dolby Vision, not its picture: the base layer
+            // plays as the HDR10 it is, where failing here would fail a load the native path plays.
+            videoDecoder.close()
+            composesDolbyVisionFEL = false
+            if let codecpar = vStream.pointee.codecpar,
+               VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder {
+                videoDecoder = HardwareVideoDecoder()
+            } else {
+                let software = SoftwareVideoDecoder()
+                software.deinterlaceConfig = deinterlaceConfig
+                videoDecoder = software
+            }
+            EngineLog.emit(
+                "[SWHost] DolbyVisionFELDecoder failed to open (\(felError)); falling back to "
+                + "\(videoDecoder is HardwareVideoDecoder ? "HardwareVideoDecoder" : "SoftwareVideoDecoder"), base layer only",
+                category: .swPlayback
+            )
+            renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(
+                forHardwareDecoder: videoDecoder is HardwareVideoDecoder))
+            try videoDecoder.open(stream: vStream, onFrame: frameHandler)
         }
 
         videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
@@ -1231,7 +1256,9 @@ final class SoftwarePlaybackHost {
     var teletextPageForSubtitleTap: Int? = nil
     var deinterlaceConfig = DeinterlaceConfig()
     /// Set by the engine before `load` when the session composes a Dolby Vision Profile 7 FEL
-    /// (`DolbyVisionFELPolicy`): the video decoder is then `DolbyVisionFELDecoder`.
+    /// (`DolbyVisionFELPolicy`): the video decoder is then `DolbyVisionFELDecoder`. Cleared by `load`
+    /// when that decoder cannot open and the host falls back to the base layer, so the engine reads
+    /// what was actually served.
     var composesDolbyVisionFEL = false
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the

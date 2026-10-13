@@ -11,17 +11,19 @@ import AetherLibavutil
 /// on as P010 pixel buffers carrying per-frame Profile 8.1 Dolby Vision metadata, so the display layer
 /// and the system's display management present them as Dolby Vision.
 ///
-/// How the metadata gets there without the engine naming a private attachment: the base layer is
-/// decoded as the single-layer Profile 8.1 stream the native path already serves (each access unit
-/// through `DoviRpuConverter`, the format description carrying a Profile 8.1 `dvvC`), with
-/// `PropagatePerFrameHDRDisplayMetadata` on. VideoToolbox then attaches the frame's Dolby Vision
-/// metadata to the base picture the way it does for any Dolby Vision decode, and the composed buffer
-/// takes over every propagatable attachment of its base picture. The converted RPU's mapping is the
-/// identity, which is correct for the composed picture: it already IS the mapped signal.
+/// How the metadata gets there: the base layer is decoded as the single-layer Profile 8.1 stream the
+/// native path already serves (each access unit through `DoviRpuConverter`, the format description
+/// carrying a Profile 8.1 `dvvC`), with `PropagatePerFrameHDRDisplayMetadata` on. VideoToolbox then
+/// attaches the frame's Dolby Vision metadata to the base picture as the undocumented
+/// `DolbyVisionUndocumentedKeys`, and the composed buffer takes those by name, in the mode they were
+/// attached in, with the rest of the base picture's propagatable attachments. The engine never builds
+/// the values. The converted RPU's mapping is the identity, which is correct for the composed picture:
+/// it already IS the mapped signal.
 ///
 /// Degrades rather than fails. No composer (no Metal, kernel did not build), an RPU the kernel does not
 /// implement, a missing or failed enhancement picture, a GPU error: the base picture goes out as it is,
-/// which is the single-layer Profile 8.1 picture the engine showed before this path existed.
+/// which is the single-layer Profile 8.1 picture the engine showed before this path existed. A session
+/// this decoder cannot open at all is the host's to fall back on (`SoftwarePlaybackHost.load`).
 final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - VideoDecodingPipeline
@@ -79,6 +81,7 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var pixelAspectRatio: AVRational?
     private var reportedFormat = false
     private var loggedFirstComposition = false
+    private var loggedMetadataPresence = false
     private var composedCount = 0
     private var baseOnlyCount = 0
 
@@ -98,10 +101,20 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         self.composer = composer
     }
 
-    /// Whether this device has what the path needs: a Metal GPU and hardware HEVC decode. Dolby Vision
-    /// presentation is the display's question and is asked by the routing, not here.
-    static var deviceCanCompose: Bool {
-        DolbyVisionFELComposer.deviceHasMetal && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+    /// What this device lacks for the path, or nil when it has it all: a Metal GPU for the composer,
+    /// hardware HEVC decode for the enhancement layer, and hardware Dolby Vision HEVC decode for the base
+    /// layer, which is what attaches the per-frame metadata the display layer presents with. Whether the
+    /// display presents Dolby Vision is the routing's question, not this one.
+    static func deviceShortfall(
+        hasMetal: Bool = DolbyVisionFELComposer.deviceHasMetal,
+        decodesHEVC: Bool = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC),
+        decodesDolbyVision: Bool = VTIsHardwareDecodeSupported(kCMVideoCodecType_DolbyVisionHEVC)
+    ) -> String? {
+        var missing: [String] = []
+        if !hasMetal { missing.append("no Metal GPU") }
+        if !decodesHEVC { missing.append("no hardware HEVC decode") }
+        if !decodesDolbyVision { missing.append("no hardware Dolby Vision decode") }
+        return missing.isEmpty ? nil : missing.joined(separator: ", ")
     }
 
     // MARK: - Lifecycle
@@ -502,14 +515,17 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
             stateLock.unlock()
         }
 
+        logDolbyVisionMetadataOnce(pair.base)
         var picture: CVPixelBuffer = pair.base
         if let composer, let params,
            let composed = composer.compose(base: pair.base, enhancement: pair.enhancement, params: params) {
-            // The base picture's attachments are the frame's: its Dolby Vision metadata first of all,
-            // and its colour. Propagated, so they reach the sample buffer the renderer builds.
+            // The base picture's attachments are the frame's: its colour and the rest of what
+            // VideoToolbox propagates, then the Dolby Vision metadata by name, in whatever mode it was
+            // attached, so a key VideoToolbox marks non-propagating is not lost on the copy.
             if let attachments = CVBufferCopyAttachments(pair.base, .shouldPropagate) {
                 CVBufferSetAttachments(composed, attachments, .shouldPropagate)
             }
+            Self.copyDolbyVisionMetadata(from: pair.base, to: composed)
             picture = composed
             composedCount += 1
             if !loggedFirstComposition {
@@ -527,6 +543,34 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         attachColour(picture)
         reportFormat(picture)
         handler(picture, pts, nil)
+    }
+
+    /// Carry the frame's undocumented Dolby Vision attachments (`DolbyVisionUndocumentedKeys`) from the
+    /// decoded base picture to the composed one, each in the mode it was attached in. Returns the keys
+    /// that were present.
+    @discardableResult
+    static func copyDolbyVisionMetadata(from base: CVBuffer, to composed: CVBuffer) -> [String] {
+        var present: [String] = []
+        for key in DolbyVisionUndocumentedKeys.perFrameMetadata {
+            var mode = CVAttachmentMode.shouldPropagate
+            guard let value = CVBufferCopyAttachment(base, key as CFString, &mode) else { continue }
+            CVBufferSetAttachment(composed, key as CFString, value, mode)
+            present.append(key)
+        }
+        return present
+    }
+
+    /// Once per session: whether VideoToolbox attached the frame's Dolby Vision metadata to the base
+    /// picture at all. Without it the composed picture still presents, as PQ HDR10 with the residual,
+    /// but the panel gets no per-frame Dolby Vision, and this line is how a capture says so.
+    private func logDolbyVisionMetadataOnce(_ base: CVBuffer) {
+        guard !loggedMetadataPresence else { return }
+        loggedMetadataPresence = true
+        let present = DolbyVisionUndocumentedKeys.perFrameMetadata.map { key -> String in
+            "\(key)=" + (CVBufferCopyAttachment(base, key as CFString, nil) == nil ? "absent" : "present")
+        }
+        EngineLog.emit("[DVFEL] base picture Dolby Vision attachments: " + present.joined(separator: " "),
+                       category: .swPlayback)
     }
 
     private func attachColour(_ buffer: CVPixelBuffer) {

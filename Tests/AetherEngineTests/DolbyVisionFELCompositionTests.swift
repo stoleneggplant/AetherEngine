@@ -1,4 +1,5 @@
 import Foundation
+import CoreVideo
 import Testing
 @testable import AetherEngine
 
@@ -166,14 +167,15 @@ struct DolbyVisionFELCompositionTests {
         #expect(!DolbyVisionFELPolicy.worthAuditing(inputs { $0.isLive = true }))
     }
 
-    @Test("turning composition off is refused on a running session, because it picks the host")
+    @Test("dual-layer playback is opt-in, and changing it is refused on a running session, because it picks the host")
     func optionIsLoadIdentity() {
         var proposed = LoadOptions()
-        proposed.composesDolbyVisionEnhancementLayer = false
+        proposed.preferDualLayerDolbyVision = true
         #expect(SessionOptionCorrection.refusedFields(from: LoadOptions(), to: proposed)
-                == ["composesDolbyVisionEnhancementLayer"])
-        #expect(SessionOptionCorrection.loadIdentityFields.contains("composesDolbyVisionEnhancementLayer"))
-        #expect(LoadOptions().composesDolbyVisionEnhancementLayer)
+                == ["preferDualLayerDolbyVision"])
+        #expect(SessionOptionCorrection.loadIdentityFields.contains("preferDualLayerDolbyVision"))
+        // Opt-in (AE#702): the single-layer conversion stays the default.
+        #expect(!LoadOptions().preferDualLayerDolbyVision)
     }
 
     // MARK: - Arithmetic
@@ -320,5 +322,154 @@ struct DolbyVisionFELCompositionTests {
         #expect(source.contains("constant int STRIDE = \(DolbyVisionComposerParams.componentStride);"))
         #expect(source.contains("constant int O_NLQ = \(DolbyVisionComposerParams.Offset.nlq);"))
         #expect(source.contains("kernel void doviFELCompose"))
+    }
+
+    // MARK: - Why a Profile 7 keeps the conversion (AE#702)
+
+    @Test("the refusal names the first gate a host can act on, and nothing when it composes")
+    func refusalReasons() {
+        #expect(DolbyVisionFELPolicy.refusal(inputs()) == nil)
+        #expect(DolbyVisionFELPolicy.refusal(inputs { $0.hostAllowsComposition = false })?
+                    .contains("preferDualLayerDolbyVision") == true)
+        #expect(DolbyVisionFELPolicy.refusal(inputs { $0.displayPresentsDolbyVision = false })
+                == "the display does not present Dolby Vision")
+        #expect(DolbyVisionFELPolicy.refusal(inputs { $0.enhancementLayerType = "MEL" }) == "enhancement layer is MEL")
+        #expect(DolbyVisionFELPolicy.refusal(inputs { $0.hardwareCanCompose = false },
+                                             hardwareShortfall: "no hardware Dolby Vision decode")
+                == "no hardware Dolby Vision decode")
+        #expect(DolbyVisionFELPolicy.refusal(inputs { $0.samplesAreLengthPrefixed = false })?
+                    .contains("Annex-B") == true)
+    }
+
+    @Test("the device shortfall names every missing piece, and nothing when all are there")
+    func deviceShortfall() {
+        #expect(DolbyVisionFELDecoder.deviceShortfall(hasMetal: true, decodesHEVC: true, decodesDolbyVision: true) == nil)
+        #expect(DolbyVisionFELDecoder.deviceShortfall(hasMetal: true, decodesHEVC: true, decodesDolbyVision: false)
+                == "no hardware Dolby Vision decode")
+        #expect(DolbyVisionFELDecoder.deviceShortfall(hasMetal: false, decodesHEVC: false, decodesDolbyVision: true)
+                == "no Metal GPU, no hardware HEVC decode")
+    }
+
+    // MARK: - DoViBaker's resampling
+
+    /// A small deterministic plane of 10-bit codes with structure in both directions.
+    private func plane(width: Int, height: Int, seed: Int) -> [[Int]] {
+        (0..<height).map { y in (0..<width).map { x in (x * 131 + y * 977 + seed * 61 + (x * y) % 17 * 29) % 1024 } }
+    }
+
+    @Test("chroma MMR luma is DoViBaker's [1 2 1] across the left-sited column, edges included")
+    func mmrLumaMatchesDoViBaker() {
+        let rows = plane(width: 10, height: 2, seed: 3)
+        let cw = 5
+        for cx in 0..<cw {
+            let ours = DolbyVisionComposerParams.mmrLuma(
+                row0: { rows[0][min(max($0, 0), 9)] }, row1: { rows[1][min(max($0, 0), 9)] },
+                chromaColumn: cx, chromaWidth: cw)
+            // DoViBaker applyDovi<true>, restated.
+            func line(_ y: [Int]) -> Int {
+                if cx == 0 { return (3 * y[0] + y[1] + 2) >> 2 }
+                if cx == cw - 1 { return (y[2 * cx - 1] + 3 * y[2 * cx] + 2) >> 2 }
+                return (y[2 * cx - 1] + 2 * y[2 * cx] + y[2 * cx + 1] + 2) >> 2
+            }
+            #expect(ours == ((line(rows[0]) + line(rows[1]) + 1) >> 1), "cx \(cx)")
+        }
+        // A flat plane stays flat.
+        #expect(DolbyVisionComposerParams.mmrLuma(row0: { _ in 600 }, row1: { _ in 600 },
+                                                  chromaColumn: 2, chromaWidth: 5) == 600)
+    }
+
+    /// DoViBaker's `upscaleEl`, restated from its source: `upsampleVert` into a clipped intermediate,
+    /// then `upsampleHorz`, indices clamped at the edges, the active (non-"paper") filters.
+    private func doViBakerUpscale(_ src: [[Int]], luma: Bool) -> [[Int]] {
+        func clip(_ v: Int) -> Int { min(max(v, 0), 0xFFFF) }
+        func even(_ y: (Int) -> Int) -> Int {
+            luma ? clip((-3 * y(-2) + 29 * y(-1) + 111 * y(0) - 9 * y(1) + 64) >> 7) : y(0)
+        }
+        func odd(_ y: (Int) -> Int) -> Int {
+            luma ? clip((-9 * y(-1) + 111 * y(0) + 29 * y(1) - 3 * y(2) + 64) >> 7)
+                 : clip((-307 * y(-1) + 2355 * y(0) + 2355 * y(1) - 307 * y(2) + 2048) >> 12)
+        }
+        let h = src.count, w = src[0].count
+        var mez = [[Int]](repeating: [Int](repeating: 0, count: w), count: 2 * h)
+        for r in 0..<h {
+            for x in 0..<w {
+                let at: (Int) -> Int = { src[min(max(r + $0, 0), h - 1)][x] }
+                mez[2 * r][x] = even(at)
+                mez[2 * r + 1][x] = odd(at)
+            }
+        }
+        var out = [[Int]](repeating: [Int](repeating: 0, count: 2 * w), count: 2 * h)
+        for r in 0..<(2 * h) {
+            for c in 0..<w {
+                let at: (Int) -> Int = { mez[r][min(max(c + $0, 0), w - 1)] }
+                out[r][2 * c] = even(at)
+                out[r][2 * c + 1] = odd(at)
+            }
+        }
+        return out
+    }
+
+    @Test("a quarter-resolution enhancement layer is upscaled exactly as DoViBaker does", arguments: [true, false])
+    func enhancementUpscaleMatchesDoViBaker(luma: Bool) {
+        let src = plane(width: 7, height: 5, seed: luma ? 1 : 2)
+        let reference = doViBakerUpscale(src, luma: luma)
+        for y in 0..<10 {
+            for x in 0..<14 {
+                let ours = DolbyVisionComposerParams.upsample2x(
+                    plane: { src[$1][$0] }, width: 7, height: 5, x: x, y: y, kind: luma ? .luma : .chroma)
+                #expect(ours == reference[y][x], "(\(x), \(y))")
+            }
+        }
+    }
+
+    @Test("upscaling a flat layer keeps it flat, so a zero residual stays zero")
+    func flatUpscaleIsFlat() {
+        for kind in [DolbyVisionComposerParams.UpsampleKind.luma, .chroma] {
+            for (x, y) in [(0, 0), (1, 1), (5, 2), (13, 9)] {
+                #expect(DolbyVisionComposerParams.upsample2x(
+                    plane: { _, _ in 512 }, width: 7, height: 5, x: x, y: y, kind: kind) == 512)
+            }
+        }
+    }
+
+    // MARK: - Dolby Vision attachments
+
+    private func pixelBuffer() -> CVPixelBuffer? {
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, nil, &pb)
+        return pb
+    }
+
+    @Test("the undocumented Dolby Vision keys are carried over in the mode they were attached in")
+    func dolbyVisionAttachmentsCarryOver() throws {
+        let base = try #require(pixelBuffer())
+        let composed = try #require(pixelBuffer())
+        let rpu = Data([0x08, 0x09, 0x0A]) as CFData
+        CVBufferSetAttachment(base, DolbyVisionUndocumentedKeys.rpuData as CFString, rpu, .shouldNotPropagate)
+        CVBufferSetAttachment(base, DolbyVisionUndocumentedKeys.compatibilityID as CFString, NSNumber(value: 1), .shouldPropagate)
+
+        let copied = DolbyVisionFELDecoder.copyDolbyVisionMetadata(from: base, to: composed)
+        #expect(copied.count == 2)
+        var mode = CVAttachmentMode.shouldPropagate
+        let value = CVBufferCopyAttachment(composed, DolbyVisionUndocumentedKeys.rpuData as CFString, &mode)
+        #expect((value as? Data) == Data([0x08, 0x09, 0x0A]))
+        #expect(mode == .shouldNotPropagate)
+        #expect((CVBufferCopyAttachment(composed, DolbyVisionUndocumentedKeys.compatibilityID as CFString, nil) as? NSNumber)?.intValue == 1)
+    }
+
+    @Test("a base picture without the keys copies nothing")
+    func missingAttachmentsCopyNothing() throws {
+        let base = try #require(pixelBuffer())
+        let composed = try #require(pixelBuffer())
+        #expect(DolbyVisionFELDecoder.copyDolbyVisionMetadata(from: base, to: composed).isEmpty)
+        #expect(CVBufferCopyAttachment(composed, DolbyVisionUndocumentedKeys.rpuData as CFString, nil) == nil)
+    }
+
+    @Test("the kernel carries DoViBaker's resampling")
+    func kernelUsesDoViBakerResampling() {
+        let source = DolbyVisionFELComposer.kernelSource
+        #expect(source.contains("int4(-3, 29, 111, -9)"))
+        #expect(source.contains("int4(-307, 2355, 2355, -307)"))
+        #expect(source.contains("inline int mmrLine("))
     }
 }

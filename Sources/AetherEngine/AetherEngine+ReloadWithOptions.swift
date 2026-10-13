@@ -276,7 +276,7 @@ enum SessionOptionCorrection {
         "sequentialOrigin",
         "heldSourceConnection",
         "sharedOutputRole",
-        "composesDolbyVisionEnhancementLayer",
+        "preferDualLayerDolbyVision",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -318,8 +318,8 @@ enum SessionOptionCorrection {
         }
         // Whether a Profile 7 FEL composes decides which host serves it (the software host composes,
         // the native path converts), and a rebuild keeps the host it is on.
-        if proposed.composesDolbyVisionEnhancementLayer != current.composesDolbyVisionEnhancementLayer {
-            refused.append("composesDolbyVisionEnhancementLayer")
+        if proposed.preferDualLayerDolbyVision != current.preferDualLayerDolbyVision {
+            refused.append("preferDualLayerDolbyVision")
         }
         return refused
     }
@@ -397,7 +397,7 @@ enum SessionOptionCorrection {
     static let knownFields: [String] = [
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling",
-        "composesDolbyVisionEnhancementLayer", "matchContentEnabled",
+        "preferDualLayerDolbyVision", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",

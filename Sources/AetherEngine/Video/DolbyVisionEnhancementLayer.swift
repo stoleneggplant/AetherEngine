@@ -99,11 +99,12 @@ enum DolbyVisionEnhancementLayer {
 /// Which session composes a Profile 7 Full Enhancement Layer instead of converting it to Profile 8.1.
 ///
 /// Everything has to hold at once, and anything missing keeps the single-layer conversion the engine
-/// already serves: the source is a Profile 7 whose first RPU says FEL (a MEL's residual is zero by
-/// construction, so composing it would spend a second decoder on nothing), the display presents Dolby
-/// Vision (without it the base layer plays as HDR10, as it always did), the device has a Metal GPU and
-/// hardware HEVC decode for both layers, the host has not turned it off, and the source is a seekable
-/// VOD whose samples are length-prefixed (the software host feeds VideoToolbox those as they are).
+/// already serves: the host opted in (`LoadOptions.preferDualLayerDolbyVision`, AE#702), the source is a
+/// Profile 7 whose first RPU says FEL (a MEL's residual is zero by construction, so composing it would
+/// spend a second decoder on nothing), the display presents Dolby Vision, the device has a Metal GPU and
+/// hardware HEVC and Dolby Vision decode, and the source is a seekable VOD whose samples are
+/// length-prefixed (the software host feeds VideoToolbox those as they are). `refusal` names the gate
+/// that failed.
 enum DolbyVisionFELPolicy {
 
     struct Inputs: Equatable, Sendable {
@@ -128,6 +129,25 @@ enum DolbyVisionFELPolicy {
             && i.sourceIsSeekable
             && i.samplesAreLengthPrefixed
             && i.hardwareCanCompose
+    }
+
+    /// Why a Profile 7 keeps the single-layer conversion, in one phrase for the log line AE#702 asks for,
+    /// or nil when it composes. Gates are named in the order a host can act on them. `hardwareShortfall`
+    /// is `DolbyVisionFELDecoder.deviceShortfall()`'s answer when the device was asked.
+    static func refusal(_ i: Inputs, hardwareShortfall: String? = nil) -> String? {
+        if i.dvProfile != 7 { return "not Profile 7" }
+        if !i.hostAllowsComposition { return "not requested (preferDualLayerDolbyVision is off)" }
+        if i.presentsBaseLayerOnly { return "dolbyVisionHandling is baseLayerOnly" }
+        if !i.displayPresentsDolbyVision { return "the display does not present Dolby Vision" }
+        if i.isLive { return "live source" }
+        if !i.sourceIsSeekable { return "forward-only source" }
+        if !i.samplesAreLengthPrefixed { return "Annex-B samples (MPEG-TS / M2TS)" }
+        if !i.hardwareCanCompose { return hardwareShortfall ?? "device cannot compose" }
+        switch i.enhancementLayerType {
+        case "FEL"?: return nil
+        case let type?: return "enhancement layer is \(type)"
+        case nil: return "first RPU unreadable (or a custom source, which has no second open to read it)"
+        }
     }
 
     /// Whether the enhancement layer is worth reading for at all, i.e. whether the load pays for a
