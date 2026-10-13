@@ -85,6 +85,11 @@ struct Issue281ColdStartRoundTripTests {
     /// either side of a bound computed from one of them (2 x 400 ms against a 550 ms fetch), and a
     /// loaded CI runner spent that 250 ms margin and reconnected, failing a test whose subject is
     /// whether the reader waits at all. The bound's calibration is checked separately, below.
+    ///
+    /// Pinned at 5 s it still failed once: the budget runs from the fetch's ISSUE, and a starved
+    /// run (every test in this suite took 24 to 29 s, the one with no origin delay at all included)
+    /// spent it before the read arrived while the landed body was still queued for its delegate.
+    /// The suite's time limit is the only bound this test needs.
     @Test("a tail read waits for a fetch already on the wire instead of connecting past it")
     func tailReadWaitsForTheInFlightPrefetch() async throws {
         let delayed = ThrottledOriginServer(
@@ -92,8 +97,11 @@ struct Issue281ColdStartRoundTripTests {
             firstByteDelayUs: { isSuffix in isSuffix ? 550_000 : 400_000 })
         let server = try #require(delayed)
         defer { server.stop() }
-        let reader = makeReader(server)
-        reader.tailPrefetchWaitBudgetForTesting = 5.0
+        let label = "tail-wait-\(UUID().uuidString.prefix(8))"
+        let log = EngineLogCapture()
+        defer { log.end() }
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!, label: label)
+        reader.tailPrefetchWaitBudgetForTesting = 90
         defer { reader.markClosed(); reader.close() }
         try reader.open()
         _ = read(reader, 64 * 1024)   // the box chain at the head
@@ -108,7 +116,7 @@ struct Issue281ColdStartRoundTripTests {
         // On the range, not on the count: the reconnect this forbids is identifiable by where it
         // starts (the read position), and a bare count cannot tell it from any other arrival.
         #expect(!server.requestedRanges.contains(where: { $0.start == tailStart + 1024 }),
-                "the tail read connected past a fetch already in flight: \(server.requestedRanges)")
+                "the tail read connected past a fetch already in flight: \(server.requestedRanges); reader log: \(log.matching(label))")
     }
 
     /// The wait above has to be bounded by something, and the bound is what one round trip against

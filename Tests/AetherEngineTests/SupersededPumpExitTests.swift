@@ -9,6 +9,34 @@ import AetherLibavutil
 /// arms: no revive-gate spend, no seek-state or failure signal to the host.
 @Suite("Superseded pump exit")
 struct SupersededPumpExitTests {
+    @Test("host retry preserves the session and coalesces before stop revokes it")
+    func retainedRecoveryCanResumeWithoutReplacingCache() throws {
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = avcodec_parameters_alloc()
+        defer { avcodec_parameters_free(&codecpar) }
+        codecpar!.pointee.codec_id = AV_CODEC_ID_H264
+        codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/live.ts"),
+            dvModeAvailable: false, isLiveSession: true)
+        let producer = try makeProducer(codecpar: codecpar!)
+        let cache = SegmentCache(forwardWindow: 4, backwardWindow: 4)
+        engine.producer = producer
+        engine.cache = cache
+        let calls = Recorder()
+        engine.onLiveSourceReopening = { calls.seek() }
+        #expect(!engine.retryLiveSourceRecovery(), "unrelated source loss cannot masquerade as retained replay")
+        engine.liveRecoveryHasVerifiedReplay = true
+        engine.barrenReopenCycles = 3
+        #expect(engine.retryLiveSourceRecovery())
+        #expect(engine.retryLiveSourceRecovery())
+        #expect(calls.seekSignals == 1, "duplicate calls cannot launch another source connection")
+        #expect(engine.cache === cache)
+        #expect(engine.producer === producer)
+        #expect(engine.barrenReopenCycles == 0)
+        #expect(engine.liveRecoveryProducer === producer)
+        engine.stop()
+        #expect(!engine.retryLiveSourceRecovery(), "a stopped session cannot reopen")
+        #expect(engine.liveRecoveryProducer == nil)
+    }
 
     private final class Recorder: @unchecked Sendable {
         private let lock = NSLock()
@@ -63,6 +91,75 @@ struct SupersededPumpExitTests {
         #expect(!engine.mainDemuxerSuspectDead)
         #expect(recorder.failures == 0)
         #expect(recorder.seekSignals == 0)
+    }
+
+    @Test("a replay exit retunes only the current producer, never a superseded channel")
+    func replayExitRequiresCurrentProducer() throws {
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        defer { avcodec_parameters_free(&codecpar) }
+        codecpar!.pointee.codec_id = AV_CODEC_ID_H264
+        codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+        let recorder = Recorder()
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/live.ts"),
+                                    dvModeAvailable: false, isLiveSession: true, sourceReopenableByURL: false)
+        engine.onLiveSourceReset = { recorder.fail() }
+        let stale = try makeProducer(codecpar: codecpar!)
+        let current = try makeProducer(codecpar: codecpar!)
+        engine.producer = current
+        engine.handlePumpFinished(stale, reason: .sourceReplay)
+        #expect(recorder.failures == 0)
+        engine.handlePumpFinished(current, reason: .sourceReplay)
+        #expect(recorder.failures == 1, "the current session still requests fresh negotiation")
+        engine.producer = nil
+        engine.handlePumpFinished(current, reason: .sourceReplay)
+        #expect(recorder.failures == 1, "a torn-down session cannot retune its successor")
+    }
+
+    @Test("verified replay exhaustion cannot silently request a reload that loses its history")
+    func replayExhaustionHasSeparateHostEvidence() throws {
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        defer { avcodec_parameters_free(&codecpar) }
+        codecpar!.pointee.codec_id = AV_CODEC_ID_H264
+        codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+        let resets = Recorder(), rejected = Recorder()
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/live.ts"),
+            dvModeAvailable: false, isLiveSession: true, sourceReopenableByURL: false)
+        engine.onLiveSourceReset = { resets.fail() }
+        engine.onLiveSourceReplayExhausted = { rejected.fail() }
+        let producer = try makeProducer(codecpar: codecpar!)
+        engine.producer = producer
+        engine.handlePumpFinished(producer, reason: .sourceReplay)
+        #expect(rejected.failures == 1)
+        #expect(resets.failures == 0)
+        engine.producer = nil
+        engine.handlePumpFinished(producer, reason: .sourceReplay)
+        #expect(rejected.failures == 1, "a retired source cannot fail its successor")
+
+        engine.liveRecoveryHasVerifiedReplay = true
+        engine.escalateLiveReopenExhaustion(transport: .url)
+        #expect(rejected.failures == 2, "an open failure after verified replay must not bypass history either")
+        #expect(resets.failures == 0)
+        engine.escalateLiveReopenExhaustion(transport: .url, replayRejected: false)
+        #expect(resets.failures == 1, "a changed track layout still requests fresh negotiation")
+    }
+
+    @Test("without a host that owns the retry, exhausted replay is a source reset")
+    func replayExhaustionFallsBackToSourceReset() throws {
+        var codecpar: UnsafeMutablePointer<AVCodecParameters>? = try #require(avcodec_parameters_alloc())
+        defer { avcodec_parameters_free(&codecpar) }
+        codecpar!.pointee.codec_id = AV_CODEC_ID_H264
+        codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+        let resets = Recorder()
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/live.ts"),
+            dvModeAvailable: false, isLiveSession: true, sourceReopenableByURL: false)
+        engine.onLiveSourceReset = { resets.fail() }
+        let producer = try makeProducer(codecpar: codecpar!)
+        engine.producer = producer
+        engine.handlePumpFinished(producer, reason: .sourceReplay)
+        #expect(resets.failures == 1, "a host that only knows liveSourceReset must still be told to retune")
+        engine.liveRecoveryHasVerifiedReplay = true
+        engine.escalateLiveReopenExhaustion(transport: .url)
+        #expect(resets.failures == 2)
     }
 
     @Test("the same read error from the session's own producer still reaches the recovery arms")

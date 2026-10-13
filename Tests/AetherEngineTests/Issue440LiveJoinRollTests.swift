@@ -427,7 +427,7 @@ struct Issue440LiveJoinRollTests {
         let contract = NativeAVPlayerHost.SessionLoadContract(
             isLive: true, liveJoinStartsImmediately: true, forwardBufferDuration: 0,
             surfaceEndFailures: true, httpHeaders: ["X-Emby-Token": "t"], armIngestFallback: false,
-            readinessDeadline: 20)
+            readinessDeadline: 20, nativeVideoFrameDiagnostics: true, nativeVideoFrameRecovery: true)
         host.load(url: URL(string: "http://127.0.0.1:1/live/media.m3u8")!,
                   startPosition: nil, contract: contract)
         #expect(host.sessionContract == contract)
@@ -443,7 +443,8 @@ struct Issue440LiveJoinRollTests {
     func newLoadStatesItsOwnContract() {
         let host = NativeAVPlayerHost()
         host.load(url: URL(string: "http://127.0.0.1:1/live/media.m3u8")!, startPosition: nil,
-                  contract: .init(isLive: true, liveJoinStartsImmediately: true))
+                  contract: .init(isLive: true, liveJoinStartsImmediately: true,
+                                  nativeVideoFrameDiagnostics: true, nativeVideoFrameRecovery: true))
         host.load(url: URL(string: "http://127.0.0.1:1/vod/media.m3u8")!, startPosition: 0,
                   contract: .init())
         #expect(host.sessionContract == NativeAVPlayerHost.SessionLoadContract())

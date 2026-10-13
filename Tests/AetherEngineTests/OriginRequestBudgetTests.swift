@@ -20,6 +20,64 @@ struct OriginRequestBudgetTests {
         return budget
     }
 
+    @Test("network completion returns a lease while its caller still retains it",
+          .timeLimit(.minutes(1)))
+    func completedLeaseUnblocksNextReader() async throws {
+        let budget = freshBudget()
+        budget.setHostLimit(1, for: url)
+        let lease = OriginRequestBudget.Lease(
+            budget.acquire(for: url, label: "probe", timeout: 1), budget: budget)
+        defer { lease.release() }
+        let granted = UnsafeFlag()
+        Thread.detachNewThread {
+            let ticket = budget.acquire(for: url, label: "playback", timeout: 120,
+                                        allowOvercommit: false)
+            granted.set(ticket?.granted == true)
+            budget.release(ticket)
+        }
+        try await waitFor { budget.snapshot(for: url)?.waiting == 1 || granted.value != nil }
+        #expect(granted.value == nil)
+        // The callback can return the slot without waiting for the lower-QoS caller to resume.
+        lease.release()
+        try await waitFor { granted.value != nil }
+        #expect(granted.value == true)
+        try await waitFor { budget.snapshot(for: url)?.inflight == 0 }
+        #expect(budget.snapshot(for: url)?.peakInflight == 1)
+    }
+
+    @Test("racing completion and cancellation return a request lease only once",
+          .timeLimit(.minutes(1)))
+    func leaseReleaseIsIdempotent() async throws {
+        let budget = freshBudget()
+        let lease = OriginRequestBudget.Lease(
+            budget.acquire(for: url, label: "completed", timeout: 1), budget: budget)
+        let other = budget.acquire(for: url, label: "still playing", timeout: 1)
+        defer { budget.release(other) }
+        let done = ProbeTestBox(0)
+        for _ in 0..<16 {
+            Thread.detachNewThread {
+                lease.release()
+                done.update { $0 += 1 }
+            }
+        }
+        try await waitFor { done.value == 16 }
+        #expect(budget.snapshot(for: url)?.inflight == 1,
+                "duplicate release must not consume the other reader's live ticket")
+        lease.release()
+        #expect(budget.snapshot(for: url)?.inflight == 1)
+    }
+
+    @Test("a lease returns an abandoned ticket on deallocation")
+    func abandonedLeaseReturnsSlot() {
+        let budget = freshBudget()
+        var lease: OriginRequestBudget.Lease? = .init(
+            budget.acquire(for: url, label: "abandoned", timeout: 1), budget: budget)
+        #expect(lease != nil)
+        #expect(budget.snapshot(for: url)?.inflight == 1)
+        lease = nil
+        #expect(budget.snapshot(for: url)?.inflight == 0)
+    }
+
     @Test("an uncapped origin hands out tickets without waiting and only tallies")
     func uncappedNeverWaits() {
         let budget = freshBudget()

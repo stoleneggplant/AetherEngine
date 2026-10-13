@@ -132,9 +132,11 @@ struct ItemSwapStillTests {
         try await waitFor { host.isVideoReadyForDisplay }
         #expect(engine.state == .playing)
         // A playing item needs ~300 ms before a fresh output sees a frame (measured here); the
-        // rebuild pauses first for that reason, but the playing read still has to work.
-        let frame = await host.captureDisplayedFrame(timeout: .seconds(2))
-        #expect(frame != nil)
+        // rebuild pauses first for that reason, but the playing read still has to work. The timeout
+        // only has to catch an output that never vends: 2 s ran out once in a starved CI run (this
+        // test took 22.7 s) with the item still playing.
+        let frame = await host.captureDisplayedFrame(timeout: .seconds(15))
+        #expect(frame != nil, "no frame while \(engine.state)")
         #expect(engine.state == .playing)
     }
 

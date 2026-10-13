@@ -162,6 +162,56 @@ Routes the host did not ask for:
 
 Branch on this where host behaviour differs per pipeline: who draws subtitles (AVPlayer on the bypass, the host's renderer on loopback and software), and whether a composited PiP overlay is meaningful at all. Observing it also makes the mid-session reroute an event rather than a log line.
 
+## Byte-reader callback scheduling
+
+The AVIO reader, held HTTP transport and prewarm fetcher use independent serial
+user-initiated URLSession delegate queues. These callbacks deliver playback bytes
+and release origin-request tickets needed by foreground demux threads. A semaphore
+wait cannot donate priority to an implicit utility callback queue. Held transport
+work also runs at user-initiated QoS.
+
+Finite AVIO requests release their ticket in the completion callback, before the
+synchronous caller resumes to process its result. A lock-guarded lease makes that
+release idempotent against cancellation, early return and deallocation. Refusal
+responses are charged to the origin before handing its slot to another reader. Persistent
+and prewarm callbacks already return their tickets at completion. Per-origin caps,
+FIFO ordering, pacing, cancellation drains and timeout/overcommit policy remain
+unchanged; each session retains its own serial callback ordering.
+
+QoS is not an execution deadline. A VOD segment already in the cache may still
+cross the slow-serve threshold while its serving thread is delayed. Its early
+chunked header remains valid: the response carries the same cached bytes, and
+the notification alone does not restart the producer.
+
+## Live replay boundary and video diagnostics
+
+Live packet admission also protects the outgoing transport boundary. A timed, flagged video
+packet beyond admitted history is held while earlier intact pictures and audio continue.
+Exact replay on the participating tracks can supply the clean returning frame; the flagged
+packet is discarded only with that evidence. Good pictures released late by the outgoing
+parser do not complete a track before its replay is traversed. Verified pending video is
+ordered by decode timestamp, exact returning copies are removed, and the settling frontier
+covers every retained good packet. An ambiguous boundary, EOF or read failure preserves its
+packets and admitted history. A clean outgoing picture cannot release the boundary on its own.
+The lookahead covers sparse-video cadence as well as the bounded source interval; the packet
+count remains capped. Held intact pictures define a provisional replay horizon, while the
+replacement for the damaged picture remains fresh media until admitted. Only committed
+packets enter retained source history. Held-video packet count and source interval bound the lookahead;
+transport and no-cut watchdog deadlines remain responsible for a source that stops delivering.
+
+Video diagnostics keep source packet cadence separate from native decoded-output progress.
+The optional output observer belongs to one item/session, stops on teardown, excludes
+ineligible playback modes and discards its state through positioning or inactive rendering.
+It emits bounded progress summaries and gap episodes, without retaining pictures or making
+recovery decisions. Hosts control whether to enable it and where to send its measurements.
+The output is detached before a host-announced PiP transition and only reattached to a ready
+inline layer after PiP ends. Native presentation repair uses layer readiness independently of
+this optional output. Its bounded nudge/item-replacement sequence requires advancing playback,
+resident buffer and an attached foreground surface; it does not reset source history or move a
+DVR viewer to the live edge. In-place item replacement preserves the repair budget, which only
+rearms after sustained healthy presentation. Encoded long-GOP H.264/AAC replay tests decode both
+admitted software packets and remuxed fragments and compare every picture with the original.
+
 ## Software VOD compressed packet cache
 
 Seekable software VOD read through one of the engine's byte readers has a
@@ -548,12 +598,85 @@ The `aetherctl` CLI target (`Sources/aetherctl/`) is documented separately in [d
 ### Exact overlap after a live source reconnect
 
 On the single-demuxer stream-copy path, rollback alone is never treated as proof
-of replay. A candidate packet must match an accepted packet's source DTS, PTS and
-compressed-payload SHA-256 signature. Candidate packets are buffered until both
-tracks have passed their previous frontier. A mismatch, read error, EOF or bounded
-history/payload limit forwards the pending packets to ordinary discontinuity
-handling. Bridged audio and separate side-audio sources are excluded.
+of replay. A rollback to a retained packet's DTS/PTS can open a provisional
+candidate even if the first payload differs. Only exact DTS, PTS and compressed-
+payload SHA-256 matches establish replay evidence. Candidate packets are buffered until both
+tracks pass their previously admitted frontier, then old media is removed and
+new media continues on the existing timeline.
 
-The cutter watchdog distinguishes an intentional overlap scan from a stuck cut
-while continuing to detect source starvation. No host API or resource policy is
-added; the guard and its packet history belong to the producer thread.
+A reconnect can truncate a transport/PES packet. Immediately forwarding a whole
+candidate after one mismatch replayed old pictures; immediately reopening after
+that mismatch repeatedly met the same damaged boundary. A short unmatched run
+including the first packet of either track is quarantined within a bounded
+source-time interval and unmatched-packet count per track. Before any exact match on a
+track, the first unmatched timestamp anchors that bound. Untimed packets remain
+under the producer's overall byte/packet limits and source watchdog. Later exact matches, or crossing that track's old
+frontier, complete the interval; discarding a candidate containing gaps also
+requires distinct matching timestamps on every participating track. Prolonged
+divergence, EOF, read failure and scan limits still interrupt a confirmed prefix
+without forwarding it. A short unconfirmed programme boundary retains normal
+discontinuity handling. A source clock reset with different content is never
+classified as replay solely by its timestamps.
+
+A supported source reopens inside the same cache. Its fresh producer receives the
+bounded accepted-packet history and source frontiers; a seek, channel change or
+independent load starts without that history. The failed socket is retired before
+the replacement opens. Changed track layouts request fresh host negotiation.
+Bridged audio and separate side-audio sources remain excluded from paired replay
+recognition.
+
+The cutter watchdog distinguishes a bounded overlap scan from a stuck cut while
+still detecting source starvation. The guard belongs to the producer thread.
+Repeated source loss parks acquisition after the existing bounded reopen budget.
+For a host that opted in with `hostRetriesExhaustedLiveReplay`,
+`liveSourceReplayExhausted` hands the retry timing to it, and it can call
+`retryLiveSourceRecovery()` without replacing the cache or consumer item. Stop or
+replacement revokes the pending retry, duplicate requests coalesce, and resumed
+production restores the provider's blocking-reload capability. Application
+backoff and error presentation remain host-owned.
+
+Corrupt packets with usable timestamps can still match identical previously
+accepted bytes: an MPEG-TS continuity flag alone does not invalidate that proof.
+Corrupt packets are held in source order during a candidate; a completed paired
+verification discards damaged boundary packets even when their usable timestamps
+are already past one track's retained frontier. Ambiguous candidates preserve their
+packets. This does not discard arbitrary damaged packets during normal playback
+or reset a decoder on a transport warning. Per-track/action diagnostics are rate-limited and include source timestamps or
+`missing`, never URLs. `forwarded` means the packet reached the normal pump path,
+not that a corrupt picture was displayed. Native `LagDiag` clock progress follows
+the AVPlayer clock; `videoFrames=unavailable` explicitly records that it is not a
+rendered-frame counter, and unavailable drop counts use `-` instead of zero.
+
+### Software live replay admission and recovery
+
+`LiveReplayPacketReader` uses the same `LivePacketReplayGuard` before recording,
+clock-discontinuity folding and ring append. Both the DVR reader and the live
+combined loop use it. Quarantine is bounded to 96 MiB and 10,000 packets; EOF,
+read failure, cancellation and explicit positioning release owned packets. A
+verified partial replay is never forwarded as fresh media. An interrupted source
+is surfaced as `liveSourceUnavailable`, leaving retry timing to the consuming
+application rather than treating transport loss as codec incompatibility.
+
+After paired verification, exact matching packets released late by the demuxer
+remain suppressed until each track has advanced beyond the backward-discontinuity
+threshold. This settling tail never discards different compressed bytes solely
+because their timestamps repeat. During a DVR cursor recovery, acquisition waits
+before appending another packet so it cannot evict the target while decoders and
+clocks are being repositioned. Memory/disk retention caps remain in force.
+
+### Live playlist renewal after a longer GOP
+
+The first live media playlist seals its target duration. If a later finalized
+segment's serialized `EXTINF`, rounded to an integer, exceeds that value, the
+provider creates a new `live-N/` playlist namespace with a larger seal. The old
+video and subtitle URLs keep their original target and retain the end index before
+an oversized segment, even after that segment leaves the live window. Relative segment/init/subtitle URLs resolve within either
+namespace to the same retained cache; source acquisition is not reopened.
+
+The native consumer swaps to the renewed URL using the existing in-place reload
+and playlist placement machinery. The viewing position and play/pause intent
+are carried across the swap, including a DVR position behind live. A renewal
+never repeats an already completed startup cushion wait. The change does not
+cut a GOP at a dependent frame or falsify a segment's duration. A consumer item
+replacement can still cause a short interruption; missing source frames cannot
+be reconstructed by this policy.

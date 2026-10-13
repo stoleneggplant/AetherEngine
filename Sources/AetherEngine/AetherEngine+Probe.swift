@@ -636,17 +636,17 @@ extension AetherEngine {
         tracks: [TrackInfo],
         override: Int32?,
         preferredLanguages: [String],
-        prefersTrueHDAtmos: Bool = false,
+        prefersObjectAudio: Bool = false,
         defaultIndex: Int32 = -1
     ) -> Int32? {
         // Explicit host override wins, but only when it names a real audio track (else fall through).
         if let override, tracks.contains(where: { $0.id == Int(override) }) {
             return override
         }
-        // #731: with object rendering on, TrueHD Atmos keeps its heights, which no other track of the
-        // same language does better, so it wins ties within a language. Never across one.
-        let atmosRank: ((Int) -> Int)? = prefersTrueHDAtmos
-            ? { isRenderableTrueHDAtmos(tracks[$0]) ? 0 : 1 }
+        // #731: with object rendering on, TrueHD Atmos and DTS:X keep their heights, which no other
+        // track of the same language does better, so they win ties within a language. Never across one.
+        let atmosRank: ((Int) -> Int)? = prefersObjectAudio
+            ? { isRenderableObjectAudio(tracks[$0]) ? 0 : 1 }
             : nil
         // Each preference is scanned across all tracks in order, so an earlier preference on a later
         // track still beats a later preference on an earlier track. Within one preference the most
@@ -660,16 +660,16 @@ extension AetherEngine {
             return Int32(tracks[index].id)
         }
         // No language preference decided it: the session would take its default track, so a TrueHD
-        // Atmos track in that track's language replaces it.
+        // Atmos or DTS:X track in that track's language replaces it.
         // Same dub only: a script or region both tags state and disagree on (es-ES against es-419) is
         // another dub, not another format of this one.
-        guard prefersTrueHDAtmos,
+        guard prefersObjectAudio,
               let fallback = tracks.first(where: { $0.id == Int(defaultIndex) }),
-              !isRenderableTrueHDAtmos(fallback),
+              !isRenderableObjectAudio(fallback),
               let language = fallback.language
         else { return nil }
         let candidates = tracks.compactMap { track -> (track: TrackInfo, rank: Int)? in
-            guard isRenderableTrueHDAtmos(track),
+            guard isRenderableObjectAudio(track),
                   let rank = languageMatchRank(track.language, language, kind: .audio),
                   rank / 3 < 2, rank % 3 < 2 else { return nil }
             return (track, rank)
@@ -687,6 +687,24 @@ extension AetherEngine {
 
     nonisolated private static let trueHDAtmosProfileName =
         VideoStreamFormat.profileName(codecID: AV_CODEC_ID_TRUEHD, profile: AV_PROFILE_TRUEHD_ATMOS)
+
+    /// DTS that FFmpeg labelled DTS:X while probing, and not a commentary. FFmpeg names only two of
+    /// DTS:X's markers, so a DTS-HD MA track it labels plain can be DTS:X as well; that one is still
+    /// rendered when it is the track that plays, but only the label can be ranked before playback.
+    /// `TrackInfo.codec` is the decoder's name, `dca` for libavcodec's DTS decoder; `dts` is the
+    /// codec's own name, which a build without the decoder would report.
+    nonisolated static func isRenderableDTSX(_ track: TrackInfo) -> Bool {
+        ["dca", "dts"].contains(track.codec.lowercased()) && !track.isCommentary && !track.isExternal
+            && dtsxProfileNames.contains(track.profile ?? "")
+    }
+
+    nonisolated private static let dtsxProfileNames = Set([AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX]
+        .compactMap { VideoStreamFormat.profileName(codecID: AV_CODEC_ID_DTS, profile: $0) })
+
+    /// The tracks object rendering keeps the heights of.
+    nonisolated static func isRenderableObjectAudio(_ track: TrackInfo) -> Bool {
+        isRenderableTrueHDAtmos(track) || isRenderableDTSX(track)
+    }
 
     /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: within the
     /// first preference (scanned in order) that has any language match, the best track by language

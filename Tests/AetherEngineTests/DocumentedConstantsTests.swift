@@ -18,6 +18,11 @@ import AetherLibavcodec
 /// Adding a number to the docs? Pin it here in the same commit.
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
+    func testLiveReplayQuarantineBoundsMatchDocumentation() throws {
+        XCTAssertEqual(LivePacketReplayGuard.maximumPendingBytes, 96 * 1_024 * 1_024)
+        XCTAssertEqual(LivePacketReplayGuard.maximumPendingPackets, 10_000)
+        assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
+    }
 
     func testItemDiagnosticBoundsMatchDocumentation() throws {
         let docs = try documentation()
@@ -247,6 +252,8 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("after the first 5 s of audio (and again after every seek), then every 30 s", docs)
         XCTAssertEqual(SpatialAudioBridge.silentFeedPacketThreshold, 1200)
         assertDocumented("returns nothing for 1200 packets in a row, a second of TrueHD", docs)
+        XCTAssertEqual(ObjectMetadataHold.maxHeldFrames, 4_800)
+        assertDocumented("(it waits at most 100 ms)", docs)
         XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 12), "apac.31.03")
         XCTAssertEqual(APACSampleEntry.codecsString(channelCount: 16), "apac.31.04")
     }

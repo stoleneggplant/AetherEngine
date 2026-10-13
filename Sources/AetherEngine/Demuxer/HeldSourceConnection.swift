@@ -121,7 +121,7 @@ final class HeldSourceConnection: @unchecked Sendable {
         self.generation = generation
         self.ticket = ticket
         self.delegate = delegate
-        self.queue = DispatchQueue(label: "aether.avio.held.\(label)")
+        self.queue = DispatchQueue(label: "aether.avio.held.\(label)", qos: .userInitiated)
     }
 
     var isCancelled: Bool {
@@ -228,7 +228,7 @@ final class HeldSourceConnection: @unchecked Sendable {
         configuration.timeoutIntervalForResource = .greatestFiniteMagnitude
         let session = URLSession(configuration: configuration,
                                  delegate: EngineTLS.sessionDelegate,
-                                 delegateQueue: nil)
+                                 delegateQueue: AVIOReader.makePlaybackDelegateQueue())
         let task = session.streamTask(withHostName: host, port: port)
 
         stateLock.lock()

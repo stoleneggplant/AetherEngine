@@ -410,6 +410,22 @@ public struct LoadOptions: Sendable, Equatable {
     /// Extra HTTP headers for HEAD probe, Range chunks, side-demuxer fetches. On the loopback paths they are NOT forwarded to AVPlayer (it hits the local server); on `nativeRemoteHLS` they ride into the AVURLAsset so header-enforcing origins (IPTV Referer / User-Agent / Authorization) work (#119). Forwarded to `selectSidecarSubtitle` by default; pass explicit headers to override (#32). Default empty.
     public var httpHeaders: [String: String]
 
+    /// Opt-in decoded-frame diagnostics for SDR native loopback playback. Default off.
+    /// Samples an additional AVPlayerItemVideoOutput; reports output gaps, not physical display
+    /// freezes. Disabled during seek/pause, external playback and mobile background activity.
+    public var nativeVideoFrameDiagnostics: Bool = false
+
+    /// Opt-in bounded repair of stalled SDR decoded output on native loopback playback.
+    /// Enables frame observation independently of diagnostics. Default off; short gaps,
+    /// unavailable output, PiP, background, external playback, pause and seeks never repair.
+    public var nativeVideoFrameRecovery: Bool = false
+
+    /// The host owns the retry after a verified live replay exhausts in-engine recovery: the engine
+    /// publishes `liveSourceReplayExhausted` and waits for `retryLiveSourceRecovery()`. Default off,
+    /// where that exhaustion publishes `liveSourceReset` like any other source loss, so a host that
+    /// only knows that event still retunes instead of holding the last frame.
+    public var hostRetriesExhaustedLiveReplay: Bool = false
+
     /// Diagnostic lever: force dvh1 codec tags + master playlist regardless of display capability. OFF by default: non-DV displays route DV through the media playlist (no master) so AVPlayer auto-tonemaps the HEVC base layer (only path that avoids AVFoundationErrorDomain -11868 on tvOS 26). AetherEngine#4.
     public var keepDvh1TagWithoutDV: Bool
 
@@ -541,9 +557,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// - `.lossless`: FLAC up to 7.1. Needs a sink that accepts multichannel LPCM (Denon / Marantz / NAD AVRs); stereo-only routes silently downmix.
     public var audioBridgeMode: AudioBridgeMode
 
-    /// TrueHD Atmos delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel decode;
-    /// `.apac(layout)` renders the Atmos objects into `layout` and delivers Apple Positional Audio,
-    /// which reaches an Atmos receiver as Dolby MAT with its heights. See `ObjectAudioRendering`.
+    /// TrueHD Atmos and DTS:X delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel
+    /// decode; `.apac(layout)` renders the objects and heights into `layout` and delivers Apple
+    /// Positional Audio, which reaches an Atmos receiver as Dolby MAT with its heights. See
+    /// `ObjectAudioRendering`.
     public var objectAudioRendering: ObjectAudioRendering
 
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
@@ -992,7 +1009,10 @@ public struct LoadOptions: Sendable, Equatable {
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
         preferredDecodePath: DecodePath = .automatic,
         escalatesToSoftwarePath: Bool = true,
-        sharedOutputRole: SharedOutputRole = .primary
+        sharedOutputRole: SharedOutputRole = .primary,
+        nativeVideoFrameDiagnostics: Bool = false,
+        nativeVideoFrameRecovery: Bool = false,
+        hostRetriesExhaustedLiveReplay: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -1044,6 +1064,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath
         self.sharedOutputRole = sharedOutputRole
+        self.nativeVideoFrameRecovery = nativeVideoFrameRecovery
+        self.nativeVideoFrameDiagnostics = nativeVideoFrameDiagnostics
+        self.hostRetriesExhaustedLiveReplay = hostRetriesExhaustedLiveReplay
     }
 }
 

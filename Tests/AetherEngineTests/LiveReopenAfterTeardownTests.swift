@@ -34,14 +34,25 @@ struct LiveReopenAfterTeardownTests {
     private final class CountingReader: IOReader, @unchecked Sendable {
         private let lock = NSLock()
         private var _reads = 0
+        private var _position = 0
+        private var _cancels = 0
+        var cancels: Int { lock.withLock { _cancels } }
         var reads: Int { lock.lock(); defer { lock.unlock() }; return _reads }
         func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
             lock.lock(); _reads += 1; lock.unlock()
-            return 0
+            guard let buffer else { return 0 }
+            return lock.withLock {
+                let bytes = TinyTransportStreamFixture.data
+                let count = min(Int(size), bytes.count - _position)
+                guard count > 0 else { return 0 }
+                bytes.withUnsafeBytes { _ = memcpy(buffer, $0.baseAddress! + _position, count) }
+                _position += count
+                return Int32(count)
+            }
         }
         func seek(offset: Int64, whence: Int32) -> Int64 { -1 }
         func close() {}
-        func cancel() {}
+        func cancel() { lock.withLock { _cancels += 1 } }
         func makeIndependentReader() -> IOReader? { nil }
         var discImageProbeEnabled: Bool { false }
     }
@@ -56,4 +67,46 @@ struct LiveReopenAfterTeardownTests {
         }
         #expect(reader.reads == 0)
     }
+    @Test("source retirement cancels the old reader while preserving codec parameters")
+    func retirementReleasesOwnedReaderBeforeReplacement() throws {
+        let reader = CountingReader()
+        let demuxer = Demuxer()
+        try demuxer.open(reader: reader, formatHint: "mpegts", isLive: true)
+        let index = demuxer.videoStreamIndex
+        let stream = try #require(demuxer.stream(at: index))
+        let video = HLSSegmentProducer.StreamConfig(codecpar: UnsafePointer(stream.pointee.codecpar),
+            timeBase: stream.pointee.time_base, codecTagOverride: "avc1")
+        let cache = SegmentCache(forwardWindow: 4, backwardWindow: 4)
+        let producer = try HLSSegmentProducer(demuxer: demuxer, videoStreamIndex: index,
+            video: video, cache: cache, videoFallbackDurationPts: 45_000,
+            desiredFirstVideoTfdtPts: 0, segmentBoundaries: [], isLive: true)
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/live.ts"),
+            dvModeAvailable: false, isLiveSession: true)
+        engine.demuxer = demuxer
+        engine.producer = producer
+        engine.videoStreamIndex = index
+        engine.savedVideoConfig = video
+        defer { engine.stop(); cache.close() }
+
+        #expect(reader.cancels == 0)
+        #expect(engine.retireLiveSourceConnection(failedProducer: producer))
+        #expect(reader.cancels == 1, "the old owned source must release its connection before reopening")
+        #expect(demuxer.stream(at: index) != nil, "muxer configuration stays alive until the validated swap")
+
+        let fresh = Demuxer()
+        defer { fresh.close() }
+        try fresh.open(reader: CountingReader(), formatHint: "mpegts", isLive: true)
+        #expect(engine.reopenedTrackLayoutMatches(fresh, failedProducer: producer))
+        let freshStream = try #require(fresh.stream(at: fresh.videoStreamIndex))
+        freshStream.pointee.time_base.den += 1
+        #expect(!engine.reopenedTrackLayoutMatches(fresh, failedProducer: producer),
+                "a changed clock must be renegotiated, not spliced using saved muxer parameters")
+        freshStream.pointee.time_base = video.timeBase
+        freshStream.pointee.codecpar.pointee.codec_id = AV_CODEC_ID_HEVC
+        #expect(!engine.reopenedTrackLayoutMatches(fresh, failedProducer: producer))
+        engine.producer = nil
+        #expect(!engine.retireLiveSourceConnection(failedProducer: producer))
+        #expect(reader.cancels == 1, "a superseded callback must not retire another source")
+    }
+
 }
