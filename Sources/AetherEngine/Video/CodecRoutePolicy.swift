@@ -100,7 +100,7 @@ extension HLSVideoEngine {
         /// Per-packet RPU rewrite P7 -> P8.1 via DoviRpuConverter; true for every P7 not served as its base layer.
         let convertP7ToProfile81: Bool
         let dvVariant: DVVariant
-        /// Per-packet HDR10+ synthesis from the RPU (`DolbyVisionHandling.hdr10PlusOnNonDVDisplay`). Only
+        /// Per-packet HDR10+ for `LoadOptions.convertsDolbyVisionToHDR10Plus`. Only
         /// ever true on the base-layer route, whose plain hvc1 is what the SEI rides in.
         let synthesizesHDR10Plus: Bool
 
@@ -498,25 +498,22 @@ extension HLSVideoEngine {
             let recordCompat = Int(r.dv_bl_signal_compatibility_id)
             let vuiNamesYCbCrBase = VideoRoutingPolicy.vuiDeclaresYCbCrHDRBase(
                 colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space)
-            // `.hdr10PlusOnNonDVDisplay` routes as `.baseLayerOnly` where it synthesizes and as
-            // `.automatic` everywhere else, so the branches below keep asking their two questions. Same
-            // policy and the same display answer as the load's format clamp and criteria request.
+            // `convertsDolbyVisionToHDR10Plus`: a session that synthesizes routes as `.baseLayerOnly`, so the
+            // branches below keep asking their two questions. Same policy and the same display answer as the
+            // load's format clamp and criteria request.
             let synthesizesHDR10Plus = VideoRoutingPolicy.synthesizesHDR10PlusFromDolbyVision(
-                handling: dolbyVisionHandling,
+                requested: convertsDolbyVisionToHDR10Plus,
                 displayPresentsDolbyVision: dvModeAvailable,
+                // The platform half is the caller's (`loadNative` applies it), so the harness can exercise
+                // the route on a Mac with `--no-dv`.
+                platformAllows: true,
                 codecID: AV_CODEC_ID_HEVC,
                 dvProfile: recordProfile,
                 dvBlCompatID: recordCompat,
                 colorTransfer: codecpar.pointee.color_trc,
                 colorMatrix: codecpar.pointee.color_space)
             let routedHandling = VideoRoutingPolicy.routedDolbyVisionHandling(
-                requested: dolbyVisionHandling,
-                displayPresentsDolbyVision: dvModeAvailable,
-                codecID: AV_CODEC_ID_HEVC,
-                dvProfile: recordProfile,
-                dvBlCompatID: recordCompat,
-                colorTransfer: codecpar.pointee.color_trc,
-                colorMatrix: codecpar.pointee.color_space)
+                requested: dolbyVisionHandling, synthesizesHDR10Plus: synthesizesHDR10Plus)
             // A Profile 5 record over a VUI that names a YCbCr HDR base is a container contradicting
             // its bitstream (the measured shape is a Profile 7 remux relabelled 5: NLQ and residual in
             // the RPU, identity mapping, HDR10 static metadata on the base). Served as dvh1.05 the
@@ -552,8 +549,10 @@ extension HLSVideoEngine {
                 default: baseRange = manifestVideoRange(codecpar)
                 }
                 let p7Note = dvVariant == .profile7 ? ", no P7 -> P8.1 conversion" : ""
+                let elNote = synthesizesHDR10Plus && dvVariant == .profile7 ? ", enhancement layer dropped" : ""
                 let hdr10PlusNote = synthesizesHDR10Plus
-                    ? ", HDR10+ (ST 2094-40) synthesized per picture from the RPU's L1 (no Dolby Vision on this display)"
+                    ? ", HDR10+ per picture (the source's own, else derived from the RPU's L1; no Dolby Vision "
+                      + "on this display)\(elNote)"
                     : ""
                 EngineLog.emit(
                     "[HLSVideoEngine] DV Profile \(recordProfile) compat=\(recordCompat): presenting the "

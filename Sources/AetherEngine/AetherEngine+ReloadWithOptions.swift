@@ -102,12 +102,16 @@ extension AetherEngine {
             // The proposal's handling against the loaded source's base layer: a correction that turns
             // the base layer on and moves to software in one step is honoured, one that keeps the
             // Dolby Vision on a Profile 5 record is refused as before.
-            // `.hdr10PlusOnNonDVDisplay` presents the base layer wherever the display has no Dolby Vision
-            // (it routes as `.baseLayerOnly` there); this guard is only about the IPT-only class, which
-            // neither handling presents.
+            // A session converting to HDR10+ presents the base layer (it routes as `.baseLayerOnly`), and
+            // whether it converts is decided against the table the load routed on (AE#535), not a second
+            // read. This guard is only about the IPT-only class, which neither route presents.
             presentsDolbyVisionBaseLayer: (proposed.dolbyVisionHandling == .baseLayerOnly
-                || (proposed.dolbyVisionHandling == .hdr10PlusOnNonDVDisplay
-                    && !Self.displayCapabilities.supportsDolbyVision))
+                || (proposed.convertsDolbyVisionToHDR10Plus
+                    && VideoRoutingPolicy.platformConvertsDolbyVisionToHDR10Plus
+                    && !Self.reloadDisplayCapabilities(
+                        observedAtLoad: sessionObservedDisplayCaps,
+                        hostAssertsDolbyVision: proposed.panelPresentsDolbyVision,
+                        readNow: { Self.displayCapabilities }).supportsDolbyVision))
                 && sourceDolbyVisionBaseLayerPresentable,
             isLive: loadedOptions.isLive,
             hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
@@ -395,7 +399,8 @@ enum SessionOptionCorrection {
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling",
+        "convertsDolbyVisionToHDR10Plus", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",

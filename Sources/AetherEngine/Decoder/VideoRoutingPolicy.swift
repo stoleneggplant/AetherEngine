@@ -293,7 +293,7 @@ enum VideoRoutingPolicy {
             colorTransfer: colorTransfer, colorMatrix: colorMatrix)
     }
 
-    /// A presentable HEVC base layer that is PQ: what `DolbyVisionHandling.hdr10PlusOnNonDVDisplay` can
+    /// A presentable HEVC base layer that is PQ: what `LoadOptions.convertsDolbyVisionToHDR10Plus` can
     /// carry HDR10+ beside. Profile 7 (HDR10 by definition), Profile 8 with compatibility 1 or 6 (BT.2020
     /// PQ), and a Profile 5 record whose VUI names a BT.2020 YCbCr PQ base. Not 8.4 (HLG), not 8.2 (SDR):
     /// HDR10+ is a PQ format. A Profile 8 with compatibility 0 is what the AE#532 correction hands the
@@ -322,46 +322,47 @@ enum VideoRoutingPolicy {
         }
     }
 
-    /// The handling a session routes on, given what the host asked for and what the display presents.
-    /// `.automatic` and `.baseLayerOnly` route as asked. `.hdr10PlusOnNonDVDisplay` routes as
-    /// `.baseLayerOnly` when it synthesizes (`synthesizesHDR10PlusFromDolbyVision`) and as `.automatic`
-    /// otherwise, so every reader of the handling below the load (the format clamp, the criteria request,
-    /// the codec route, the software-path guard) keeps asking the two questions it already asks.
-    static func routedDolbyVisionHandling(
-        requested: DolbyVisionHandling,
-        displayPresentsDolbyVision: Bool,
-        codecID: AVCodecID,
-        dvProfile: Int?,
-        dvBlCompatID: Int?,
-        colorTransfer: AVColorTransferCharacteristic,
-        colorMatrix: AVColorSpace
-    ) -> DolbyVisionHandling {
-        switch requested {
-        case .automatic, .baseLayerOnly:
-            return requested
-        case .hdr10PlusOnNonDVDisplay:
-            return synthesizesHDR10PlusFromDolbyVision(
-                handling: requested, displayPresentsDolbyVision: displayPresentsDolbyVision,
-                codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBlCompatID,
-                colorTransfer: colorTransfer, colorMatrix: colorMatrix) ? .baseLayerOnly : .automatic
-        }
+    /// Whether this platform's display answer is good enough to give Dolby Vision away for HDR10+. tvOS and
+    /// iOS read Dolby Vision support from the display's own mode table, so "no Dolby Vision" there is a
+    /// measurement. macOS has no per-mode table and never claims Dolby Vision unless the host asserts it
+    /// (`panelPresentsDolbyVision`), while AVFoundation goes on composing the RPU on an EDR display all the
+    /// same (AE#515), so on a Mac "no Dolby Vision" is an absence of information and converting would take
+    /// the Dolby Vision away from a display that shows it. visionOS composes Dolby Vision itself.
+    static var platformConvertsDolbyVisionToHDR10Plus: Bool {
+        #if os(tvOS) || os(iOS)
+        return true
+        #else
+        return false
+        #endif
     }
 
     /// Whether this session serves the base layer with HDR10+ synthesized from the RPU: the host asked for
-    /// it, the display does not present Dolby Vision (one that does gets the Dolby Vision itself), and the
-    /// source has a PQ HEVC base layer to carry it.
+    /// it, the platform can tell that the display has no Dolby Vision and it has none (one that does gets
+    /// the Dolby Vision itself), and the source has a PQ HEVC base layer to carry it.
     static func synthesizesHDR10PlusFromDolbyVision(
-        handling: DolbyVisionHandling,
+        requested: Bool,
         displayPresentsDolbyVision: Bool,
+        platformAllows: Bool = platformConvertsDolbyVisionToHDR10Plus,
         codecID: AVCodecID,
         dvProfile: Int?,
         dvBlCompatID: Int?,
         colorTransfer: AVColorTransferCharacteristic,
         colorMatrix: AVColorSpace
     ) -> Bool {
-        guard handling == .hdr10PlusOnNonDVDisplay, !displayPresentsDolbyVision else { return false }
+        guard requested, platformAllows, !displayPresentsDolbyVision else { return false }
         return dolbyVisionBaseLayerIsPQ(
             codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBlCompatID,
             colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+    }
+
+    /// The handling a session routes on. A session that synthesizes HDR10+ routes as `.baseLayerOnly`, the
+    /// route the SEI rides in (plain hvc1, the record stripped, HDR10 criteria); every other session routes
+    /// on the handling it asked for. So every reader below the load (the format clamp, the criteria
+    /// request, the codec route, the software-path guard) keeps asking the two questions it already asks.
+    static func routedDolbyVisionHandling(
+        requested: DolbyVisionHandling,
+        synthesizesHDR10Plus: Bool
+    ) -> DolbyVisionHandling {
+        synthesizesHDR10Plus ? .baseLayerOnly : requested
     }
 }

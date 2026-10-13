@@ -4,7 +4,8 @@ import AetherLibavcodec
 import AetherLibavutil
 @testable import AetherEngine
 
-/// `DolbyVisionHandling.hdr10PlusOnNonDVDisplay`: HDR10+ (ST 2094-40) synthesized from a Dolby Vision RPU.
+/// `LoadOptions.convertsDolbyVisionToHDR10Plus`: HDR10+ (ST 2094-40) for a Dolby Vision source, the source's own
+/// where it has any, otherwise derived from its RPU.
 ///
 /// The golden values come from an independent reference model of the same mapping (Python), whose output
 /// was checked three ways off-device: every payload parses and passes hdr10plus_tool's validator as
@@ -177,43 +178,39 @@ struct DolbyVisionHDR10PlusTests {
 
     private static let vps = hevcNAL(type: 32, payload: [0x0C, 0x01])
     private static let slice = hevcNAL(type: 1, payload: [0x80, 0xAA, 0xBB])   // TRAIL_R, first slice
+    private static let enhancementLayer = hevcNAL(type: 63, payload: [0x01, 0x02, 0x03])
+    private static let derivedShotSEI = Mapping.hevcPrefixSEINAL(
+        t35Payload: Mapping.t35Payload(Mapping.metadata(for: .init(minPQ: 0, maxPQ: 3079, avgPQ: 1900))))
+    private static var nativeSEI: [UInt8] {
+        Mapping.hevcPrefixSEINAL(t35Payload: hexBytes(golden[1].payloadHex))
+    }
 
-    @Test("The SEI goes in front of the first slice; every other byte passes through")
+    @Test("The derived SEI goes in front of the first slice; every other byte passes through")
     func injectsBeforeFirstSlice() {
         let synthesizer = DolbyVisionHDR10PlusSynthesizer()
-        let rpu = Self.rpuShot
-        let packet = Self.avccPacket([Self.vps, Self.slice, rpu])
+        let packet = Self.avccPacket([Self.vps, Self.slice, Self.rpuShot])
         defer { Self.free(packet) }
 
-        #expect(synthesizer.process(packet, framing: .lengthPrefixed(size: 4)) == .injected)
-        let nals = Self.nals(packet)
-        #expect(nals.map { ($0[0] >> 1) & 0x3F } == [32, 39, 1, 62])
-        #expect(nals[0] == Self.vps)
-        #expect(nals[2] == Self.slice)
-        #expect(nals[3] == rpu)
-        let expected = Mapping.hevcPrefixSEINAL(
-            t35Payload: Mapping.t35Payload(Mapping.metadata(for: .init(minPQ: 0, maxPQ: 3079, avgPQ: 1900))))
-        #expect(nals[1] == expected)
+        #expect(synthesizer.process(packet, framing: .lengthPrefixed(size: 4)) == .derived)
+        #expect(Self.nals(packet) == [Self.vps, Self.derivedShotSEI, Self.slice, Self.rpuShot])
         // The scan that flips the published label to `.hdr10Plus` downstream sees it.
         #expect(HDR10PlusMetadataScan.packetCarriesHDR10Plus(
             packet, codecID: AV_CODEC_ID_HEVC, framing: .lengthPrefixed(size: 4)))
-        #expect(synthesizer.injectedCount == 1)
+        #expect(synthesizer.derivedCount == 1)
     }
 
     @Test("Annex B packets keep their framing")
     func injectsAnnexB() {
-        let synthesizer = DolbyVisionHDR10PlusSynthesizer()
+        let synthesizer = DolbyVisionHDR10PlusSynthesizer(dropsEnhancementLayer: true)
+        let start: [UInt8] = [0, 0, 0, 1]
         var bytes: [UInt8] = []
-        for nal in [Self.vps, Self.slice, Self.rpuShot] { bytes += [0, 0, 0, 1] + nal }
+        for nal in [Self.vps, Self.slice, Self.rpuShot, Self.enhancementLayer] { bytes += start + nal }
         let packet = Self.packet(bytes)
         defer { Self.free(packet) }
 
-        #expect(synthesizer.process(packet, framing: .annexB) == .injected)
+        #expect(synthesizer.process(packet, framing: .annexB) == .derived)
         let out = Array(UnsafeBufferPointer(start: packet.pointee.data, count: Int(packet.pointee.size)))
-        let sei = Mapping.hevcPrefixSEINAL(
-            t35Payload: Mapping.t35Payload(Mapping.metadata(for: .init(minPQ: 0, maxPQ: 3079, avgPQ: 1900))))
-        let start: [UInt8] = [0, 0, 0, 1]
-        #expect(out == start + Self.vps + start + sei + start + Self.slice + start + Self.rpuShot)
+        #expect(out == start + Self.vps + start + Self.derivedShotSEI + start + Self.slice + start + Self.rpuShot)
     }
 
     @Test("A picture without an RPU keeps the shot's metadata; nothing before the first RPU")
@@ -226,28 +223,103 @@ struct DolbyVisionHDR10PlusTests {
 
         let first = Self.avccPacket([Self.slice, Self.rpuShotWithL3])
         defer { Self.free(first) }
-        #expect(synthesizer.process(first, framing: .lengthPrefixed(size: 4)) == .injected)
+        #expect(synthesizer.process(first, framing: .lengthPrefixed(size: 4)) == .derived)
 
         let later = Self.avccPacket([Self.slice])
         defer { Self.free(later) }
-        #expect(synthesizer.process(later, framing: .lengthPrefixed(size: 4)) == .injected)
+        #expect(synthesizer.process(later, framing: .lengthPrefixed(size: 4)) == .derived)
         #expect(Self.nals(later)[0] == Self.nals(first)[0])
     }
 
-    @Test("A source with HDR10+ of its own is served as it is, for the rest of the session")
-    func standsDownForNativeHDR10Plus() {
+    @Test("The source's own HDR10+ SEI is served as it is, and nothing is derived after it")
+    func servesNativeInBand() {
         let synthesizer = DolbyVisionHDR10PlusSynthesizer()
-        let native = Mapping.hevcPrefixSEINAL(t35Payload: Self.hexBytes(Self.golden[0].payloadHex))
-        let packet = Self.avccPacket([native, Self.slice, Self.rpuShot])
+        let packet = Self.avccPacket([Self.nativeSEI, Self.slice, Self.rpuShot])
         defer { Self.free(packet) }
-        #expect(synthesizer.process(packet, framing: .lengthPrefixed(size: 4)) == .sourceCarriesHDR10Plus)
-        #expect(Self.nals(packet) == [native, Self.slice, Self.rpuShot])
+        #expect(synthesizer.process(packet, framing: .lengthPrefixed(size: 4)) == .nativeInBand)
+        #expect(Self.nals(packet) == [Self.nativeSEI, Self.slice, Self.rpuShot])
+        #expect(synthesizer.servesNativeHDR10Plus)
 
+        // A later picture without its own message goes without, rather than with a derived one.
         let next = Self.avccPacket([Self.slice, Self.rpuShot])
         defer { Self.free(next) }
-        #expect(synthesizer.process(next, framing: .lengthPrefixed(size: 4)) == .sourceCarriesHDR10Plus)
+        #expect(synthesizer.process(next, framing: .lengthPrefixed(size: 4)) == .noMetadata)
         #expect(Self.nals(next) == [Self.slice, Self.rpuShot])
-        #expect(synthesizer.injectedCount == 0)
+        #expect(synthesizer.derivedCount == 0)
+    }
+
+    @Test("An audit that found native HDR10+ means nothing is ever derived, from the first picture")
+    func auditedNativeNeverDerives() {
+        for native in [DolbyVisionHDR10PlusAudit.Result.NativeHDR10Plus.inBand, .sideDataOnly] {
+            let synthesizer = DolbyVisionHDR10PlusSynthesizer(nativeHDR10Plus: native)
+            let packet = Self.avccPacket([Self.slice, Self.rpuShot])
+            defer { Self.free(packet) }
+            #expect(synthesizer.process(packet, framing: .lengthPrefixed(size: 4)) == .noMetadata)
+            #expect(Self.nals(packet) == [Self.slice, Self.rpuShot])
+        }
+        let absent = DolbyVisionHDR10PlusSynthesizer(nativeHDR10Plus: .absent)
+        let packet = Self.avccPacket([Self.slice, Self.rpuShot])
+        defer { Self.free(packet) }
+        #expect(absent.process(packet, framing: .lengthPrefixed(size: 4)) == .derived)
+    }
+
+    @Test("HDR10+ that exists only as side data is serialized into the bitstream, ahead of the RPU")
+    func serializesSideData() throws {
+        let packet = Self.avccPacket([Self.slice, Self.rpuShot])
+        defer { Self.free(packet) }
+        // What matroskadec hands on for a BlockAddition: a parsed AVDynamicHDRPlus as packet side data.
+        let payload = Self.hexBytes(Self.golden[1].payloadHex)
+        var allocationSize = 0
+        let parsed = try #require(av_dynamic_hdr_plus_alloc(&allocationSize))
+        defer { av_free(parsed) }
+        let body = Array(payload.dropFirst(6))
+        #expect(body.withUnsafeBufferPointer { av_dynamic_hdr_plus_from_t35(parsed, $0.baseAddress, $0.count) } >= 0)
+        let sideData = try #require(av_packet_new_side_data(packet, AV_PKT_DATA_DYNAMIC_HDR10_PLUS, allocationSize))
+        memcpy(sideData, parsed, allocationSize)
+
+        let synthesizer = DolbyVisionHDR10PlusSynthesizer()
+        #expect(synthesizer.process(packet, framing: .lengthPrefixed(size: 4)) == .nativeFromSideData)
+        let nals = Self.nals(packet)
+        #expect(nals.map { ($0[0] >> 1) & 0x3F } == [39, 1, 62])
+        #expect(HDR10PlusMetadataScan.bytesCarryHDR10Plus(
+            packet.pointee.data, size: Int(packet.pointee.size), codecID: AV_CODEC_ID_HEVC,
+            framing: .lengthPrefixed(size: 4)))
+        // The serialized message states the side data's values (the dark-scene vector: 18.7 nits average).
+        let reparsed = try #require(av_dynamic_hdr_plus_alloc(nil))
+        defer { av_free(reparsed) }
+        // NAL header (2), then the SEI message: type, size, the T.35 payload, the trailing bits.
+        let rbsp = Self.unescape(Array(nals[0].dropFirst(2)))
+        let messageSize = Int(rbsp[1])
+        let t35 = Array(rbsp[2..<(2 + messageSize)])
+        #expect(Array(t35.prefix(6)) == [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04])
+        let t35Body = Array(t35.dropFirst(6))
+        #expect(t35Body.withUnsafeBufferPointer {
+            av_dynamic_hdr_plus_from_t35(reparsed, $0.baseAddress, $0.count)
+        } >= 0)
+        let average = reparsed.pointee.params.0.average_maxrgb
+        #expect(average.num * 100_000 / max(average.den, 1) == Int32(Self.golden[1].averageMaxRGB))
+        #expect(synthesizer.derivedCount == 0)
+    }
+
+    @Test("A Profile 7 enhancement layer is dropped, whichever HDR10+ is served")
+    func dropsEnhancementLayer() {
+        let derived = DolbyVisionHDR10PlusSynthesizer(dropsEnhancementLayer: true)
+        let packet = Self.avccPacket([Self.slice, Self.rpuShot, Self.enhancementLayer])
+        defer { Self.free(packet) }
+        #expect(derived.process(packet, framing: .lengthPrefixed(size: 4)) == .derived)
+        #expect(Self.nals(packet) == [Self.derivedShotSEI, Self.slice, Self.rpuShot])
+
+        let native = DolbyVisionHDR10PlusSynthesizer(nativeHDR10Plus: .inBand, dropsEnhancementLayer: true)
+        let withNative = Self.avccPacket([Self.nativeSEI, Self.slice, Self.rpuShot, Self.enhancementLayer])
+        defer { Self.free(withNative) }
+        #expect(native.process(withNative, framing: .lengthPrefixed(size: 4)) == .nativeInBand)
+        #expect(Self.nals(withNative) == [Self.nativeSEI, Self.slice, Self.rpuShot])
+
+        let keeps = DolbyVisionHDR10PlusSynthesizer()
+        let untouched = Self.avccPacket([Self.slice, Self.rpuShot, Self.enhancementLayer])
+        defer { Self.free(untouched) }
+        _ = keeps.process(untouched, framing: .lengthPrefixed(size: 4))
+        #expect(Self.nals(untouched).last == Self.enhancementLayer)
     }
 
     @Test("A length prefix this rewrite does not emit is left alone")
@@ -259,6 +331,39 @@ struct DolbyVisionHDR10PlusTests {
         #expect(packet.pointee.size == Int32(2 + Self.slice.count))
     }
 
+    // MARK: - Static metadata fallback
+
+    @Test("The RPU's L6 (with L9 primaries) is read, and attached only where the container has none")
+    func staticMetadataFallback() throws {
+        let metadata = try #require(Self.rpuShot.withUnsafeBufferPointer {
+            DolbyVisionHDR10PlusAudit.staticMetadata(ofRPU: $0.baseAddress!, length: $0.count)
+        })
+        // dovi_tool generated the fixture with L6 1000 / 0.0001 / 1000 / 400 and the default L9, P3-D65.
+        #expect(metadata.maxMasteringLuminance == 1000)
+        #expect(abs(metadata.minMasteringLuminance - 0.0001) < 1e-9)
+        #expect(metadata.maxCLL == 1000)
+        #expect(metadata.maxFALL == 400)
+        #expect(metadata.primaries == DolbyVisionHDR10PlusAudit.predefinedPrimaries[0])
+
+        let codecpar = try #require(avcodec_parameters_alloc())
+        var owned: UnsafeMutablePointer<AVCodecParameters>? = codecpar
+        defer { avcodec_parameters_free(&owned) }
+        let added = DolbyVisionHDR10PlusAudit.attachStaticMetadata(metadata, to: codecpar)
+        #expect(added.masteringDisplay && added.contentLight)
+        let mdcv = try #require(av_packet_side_data_get(
+            codecpar.pointee.coded_side_data, codecpar.pointee.nb_coded_side_data,
+            AV_PKT_DATA_MASTERING_DISPLAY_METADATA))
+        mdcv.pointee.data.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { m in
+            #expect(m.pointee.max_luminance.num == 1000 * 10000)
+            #expect(m.pointee.display_primaries.0.0.num == 34000)    // red x 0.68
+            #expect(m.pointee.has_primaries == 1 && m.pointee.has_luminance == 1)
+        }
+        // What the container already states is kept.
+        let again = DolbyVisionHDR10PlusAudit.attachStaticMetadata(metadata, to: codecpar)
+        #expect(!again.masteringDisplay && !again.contentLight)
+        #expect(codecpar.pointee.nb_coded_side_data == 2)
+    }
+
     // MARK: - Routing
 
     private static func synthesizes(
@@ -266,22 +371,23 @@ struct DolbyVisionHDR10PlusTests {
         trc: AVColorTransferCharacteristic = AVCOL_TRC_SMPTE2084,
         matrix: AVColorSpace = AVCOL_SPC_BT2020_NCL,
         dvDisplay: Bool = false,
-        handling: DolbyVisionHandling = .hdr10PlusOnNonDVDisplay
+        requested: Bool = true,
+        platform: Bool = true
     ) -> Bool {
         VideoRoutingPolicy.synthesizesHDR10PlusFromDolbyVision(
-            handling: handling, displayPresentsDolbyVision: dvDisplay, codecID: codec,
-            dvProfile: profile, dvBlCompatID: compat, colorTransfer: trc, colorMatrix: matrix)
+            requested: requested, displayPresentsDolbyVision: dvDisplay, platformAllows: platform,
+            codecID: codec, dvProfile: profile, dvBlCompatID: compat, colorTransfer: trc, colorMatrix: matrix)
     }
 
-    @Test("Synthesis only where the display has no Dolby Vision and the base layer is HEVC PQ")
+    @Test("Conversion only where the display has no Dolby Vision and the base layer is HEVC PQ")
     func routingTable() {
         #expect(Self.synthesizes(profile: 8, compat: 1))
         #expect(Self.synthesizes(profile: 7, compat: 6))
         #expect(Self.synthesizes(profile: 5, compat: 0))                     // a relabelled P7 / P8 remux
         #expect(Self.synthesizes(profile: 8, compat: 0))                     // what AE#532 hands the route
         #expect(!Self.synthesizes(profile: 8, compat: 1, dvDisplay: true))   // a DV display keeps DV
-        #expect(!Self.synthesizes(profile: 8, compat: 1, handling: .baseLayerOnly))
-        #expect(!Self.synthesizes(profile: 8, compat: 1, handling: .automatic))
+        #expect(!Self.synthesizes(profile: 8, compat: 1, requested: false))
+        #expect(!Self.synthesizes(profile: 8, compat: 1, platform: false))   // macOS: no per-mode table
         #expect(!Self.synthesizes(profile: 8, compat: 4, trc: AVCOL_TRC_ARIB_STD_B67))   // 8.4: HLG
         #expect(!Self.synthesizes(profile: 8, compat: 2, trc: AVCOL_TRC_BT709, matrix: AVCOL_SPC_BT709))
         #expect(!Self.synthesizes(profile: 5, compat: 0, trc: AVCOL_TRC_UNSPECIFIED, matrix: AVCOL_SPC_UNSPECIFIED))
@@ -289,27 +395,45 @@ struct DolbyVisionHDR10PlusTests {
         #expect(!Self.synthesizes(profile: nil, compat: nil))
     }
 
-    @Test("Where it synthesizes it routes as the base layer, elsewhere as automatic")
+    @Test("The platform gate: tvOS and iOS convert, macOS and visionOS do not")
+    func platformGate() {
+        #if os(tvOS) || os(iOS)
+        #expect(VideoRoutingPolicy.platformConvertsDolbyVisionToHDR10Plus)
+        #else
+        #expect(!VideoRoutingPolicy.platformConvertsDolbyVisionToHDR10Plus)
+        #endif
+    }
+
+    @Test("A converting session routes as the base layer; every other one as it asked")
     func routedHandling() {
-        func routed(dvDisplay: Bool, profile: Int, compat: Int,
-                    trc: AVColorTransferCharacteristic = AVCOL_TRC_SMPTE2084) -> DolbyVisionHandling {
-            VideoRoutingPolicy.routedDolbyVisionHandling(
-                requested: .hdr10PlusOnNonDVDisplay, displayPresentsDolbyVision: dvDisplay,
-                codecID: AV_CODEC_ID_HEVC, dvProfile: profile, dvBlCompatID: compat,
-                colorTransfer: trc, colorMatrix: AVCOL_SPC_BT2020_NCL)
-        }
-        #expect(routed(dvDisplay: false, profile: 8, compat: 1) == .baseLayerOnly)
-        #expect(routed(dvDisplay: true, profile: 8, compat: 1) == .automatic)
-        #expect(routed(dvDisplay: false, profile: 8, compat: 4, trc: AVCOL_TRC_ARIB_STD_B67) == .automatic)
         for handling in [DolbyVisionHandling.automatic, .baseLayerOnly] {
             #expect(VideoRoutingPolicy.routedDolbyVisionHandling(
-                requested: handling, displayPresentsDolbyVision: false, codecID: AV_CODEC_ID_HEVC,
-                dvProfile: 8, dvBlCompatID: 1, colorTransfer: AVCOL_TRC_SMPTE2084,
-                colorMatrix: AVCOL_SPC_BT2020_NCL) == handling)
+                requested: handling, synthesizesHDR10Plus: true) == .baseLayerOnly)
+            #expect(VideoRoutingPolicy.routedDolbyVisionHandling(
+                requested: handling, synthesizesHDR10Plus: false) == handling)
         }
     }
 
+    @Test("The option is a tuning field the reload registry knows")
+    func reloadRegistry() {
+        #expect(SessionOptionCorrection.knownFields.contains("convertsDolbyVisionToHDR10Plus"))
+        #expect(!SessionOptionCorrection.loadIdentityFields.contains("convertsDolbyVisionToHDR10Plus"))
+        #expect(LoadOptions().convertsDolbyVisionToHDR10Plus == false)
+    }
+
     // MARK: - Helpers
+
+    /// Emulation-prevention bytes out: 00 00 03 -> 00 00.
+    private static func unescape(_ bytes: [UInt8]) -> [UInt8] {
+        var out: [UInt8] = []
+        var zeros = 0
+        for byte in bytes {
+            if zeros >= 2, byte == 3 { zeros = 0; continue }
+            out.append(byte)
+            zeros = byte == 0 ? zeros + 1 : 0
+        }
+        return out
+    }
 
     private static func close(_ a: UInt32, _ b: UInt32) -> Bool { a > b ? a - b <= 1 : b - a <= 1 }
 

@@ -400,20 +400,6 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     /// A Profile 5 or AV1 Profile 10.0 whose VUI says nothing carries IPT-PQ-c2 and has no base layer to
     /// present, so it keeps its Dolby Vision route and the engine says so in the log.
     case baseLayerOnly
-    /// Dolby Vision on a display that presents it; on one that does not, the HDR10 base layer with
-    /// HDR10+ (SMPTE ST 2094-40) dynamic metadata derived per shot from the RPU, for an HDR10+ TV that
-    /// would otherwise get one static HDR10 grade for the whole title. Routed like `.baseLayerOnly`
-    /// (`hvc1`, `dvcC` stripped, HDR10 display criteria) with one Profile A HDR10+ SEI spliced in front of
-    /// each picture; the RPU's L1 brightness (with CM v4.0 L3 applied) supplies the peak and average the
-    /// TV tone-maps from (`DolbyVisionHDR10PlusMapping` documents the mapping and where it comes from).
-    /// A source that already carries HDR10+ keeps its own and nothing is synthesized.
-    ///
-    /// Only for an HEVC source with a PQ base layer: Profile 7, Profile 8.1, and a Profile 5 record over a
-    /// BT.2020 YCbCr PQ VUI (the mislabelled remux `.baseLayerOnly` documents). HDR10+ is a PQ format, so
-    /// Profile 8.4 (HLG) and 8.2 (SDR) keep `.automatic`; so does a genuine Profile 5, whose IPT-PQ-c2 has
-    /// no base layer to carry the metadata, and AV1 Profile 10, whose RPU and HDR10+ would both ride in
-    /// metadata OBUs this rewrite does not author. Ignored on a display that presents Dolby Vision.
-    case hdr10PlusOnNonDVDisplay
 }
 
 public struct LoadOptions: Sendable, Equatable {
@@ -462,6 +448,25 @@ public struct LoadOptions: Sendable, Equatable {
     /// layer alone in any case, so there it only lifts the Profile 5 refusal (#176) for a record the VUI
     /// contradicts.
     public var dolbyVisionHandling: DolbyVisionHandling
+
+    /// Convert Dolby Vision to HDR10+ for a display without Dolby Vision. Default `false`.
+    ///
+    /// An HDR10+ TV without Dolby Vision (most Samsung panels) otherwise receives a Dolby Vision title's
+    /// HDR10 base layer and one static grade for the whole film. With this set, on such a display, an HEVC
+    /// Profile 7 / 8.1 source (or a Profile 5 record over a BT.2020 YCbCr PQ VUI) is served as its HDR10
+    /// base layer, routed as `.baseLayerOnly` routes it, with one HDR10+ (ST 2094-40, Profile A) SEI per
+    /// picture derived from that picture's RPU (`DolbyVisionHDR10PlusMapping` documents the mapping and its
+    /// references). The source's own HDR10+, when it has any, is served instead and nothing is derived; a
+    /// Profile 7 enhancement layer is dropped from the samples; and when the base layer carries no static
+    /// HDR10 metadata of its own, the RPU's Level 6 supplies it.
+    ///
+    /// A display that presents Dolby Vision keeps Dolby Vision. tvOS and iOS only: macOS cannot tell a
+    /// display without Dolby Vision from one it was not told about, so the option is inert there. Profile
+    /// 8.4 (HLG), 8.2 (SDR), a genuine Profile 5 and AV1 keep their route. Combines with
+    /// `dolbyVisionHandling`: under `.baseLayerOnly` the base layer is served everywhere and this adds the
+    /// HDR10+ where the display has no Dolby Vision. A tuning field, correctable through
+    /// `reloadAtCurrentPosition(applying:)`.
+    public var convertsDolbyVisionToHDR10Plus: Bool
 
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
@@ -944,6 +949,7 @@ public struct LoadOptions: Sendable, Equatable {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        convertsDolbyVisionToHDR10Plus: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -994,6 +1000,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.convertsDolbyVisionToHDR10Plus = convertsDolbyVisionToHDR10Plus
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel

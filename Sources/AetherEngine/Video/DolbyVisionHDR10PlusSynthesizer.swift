@@ -3,122 +3,193 @@ import AetherLibavcodec
 import AetherLibavutil
 import Dovi
 
-/// Per-session HDR10+ synthesis from a Dolby Vision RPU (`DolbyVisionHandling.hdr10PlusOnNonDVDisplay`).
+/// Per-session packet rewrite for `LoadOptions.convertsDolbyVisionToHDR10Plus`.
 ///
-/// For each HEVC access unit it reads the RPU's L1 (and CM v4.0 L3) with libdovi, maps it through
-/// `DolbyVisionHDR10PlusMapping`, and splices one ST 2094-40 prefix SEI in front of the access unit's first
-/// slice. Everything else in the packet is passed through byte for byte, the RPU included, so the HDR10 base
-/// layer the session serves is the same picture it was; only the dynamic metadata beside it is new. The
-/// HDR10+ scan downstream (`HDR10PlusMetadataScan`) then sees the SEI like any other, which is what flips
-/// the published `videoFormat` to `.hdr10Plus`.
+/// For each HEVC access unit, in this order of preference:
+/// 1. The source's own HDR10+ SEI, when the picture carries one: passed through untouched.
+/// 2. The source's own HDR10+ as packet side data (a Matroska BlockAddition, which never reaches AVPlayer):
+///    re-serialized into a prefix SEI.
+/// 3. HDR10+ derived from the RPU: L1 (and CM v4.0 L3) read with libdovi and mapped through
+///    `DolbyVisionHDR10PlusMapping` into a prefix SEI.
 ///
-/// It stands down for the whole session the first time the source turns out to carry HDR10+ SEI of its own
-/// (Blu-ray Profile 7 and remuxes made from it often carry both): a graded HDR10+ track is better evidence
-/// than one derived from L1, and two sets of ST 2094-40 messages per picture would contradict each other.
+/// Derived metadata is never mixed with native metadata. A session whose load-time audit
+/// (`DolbyVisionHDR10PlusAudit`) found native HDR10+ never derives, and one that meets native HDR10+ mid-stream
+/// (a custom reader has no audit) stops deriving from that picture on. A picture with nothing to serve under
+/// rule 1 or 2 in such a session goes without, rather than with a derived value next to graded ones.
 ///
-/// Not thread-safe: one instance belongs to one producer read loop.
+/// The SEI goes in front of the access unit's first slice. A Profile 7 enhancement layer (unspec63), which
+/// nothing on this route decodes, is dropped. Everything else, the RPU included, passes through byte for
+/// byte, so the HDR10 base layer is the same picture it was. The HDR10+ scan downstream
+/// (`HDR10PlusMetadataScan`) sees the SEI like any other, which flips the published `videoFormat` to
+/// `.hdr10Plus`.
+///
+/// Not thread-safe: one instance belongs to one producer read loop (or one I-frame read).
 final class DolbyVisionHDR10PlusSynthesizer {
 
     enum Outcome: Equatable {
-        /// An HDR10+ SEI was spliced in front of the access unit's first slice.
-        case injected
-        /// The source carries HDR10+ itself; the session no longer synthesizes.
-        case sourceCarriesHDR10Plus
-        /// No RPU with L1 has been seen yet, or the packet holds no slice to put the SEI in front of.
+        /// An SEI derived from the RPU was spliced in front of the first slice.
+        case derived
+        /// The picture's own HDR10+ SEI was passed through.
+        case nativeInBand
+        /// The picture's own HDR10+ side data was serialized into an SEI.
+        case nativeFromSideData
+        /// Nothing to serve: no RPU with L1 seen yet, no slice to put an SEI in front of, or a session with
+        /// native HDR10+ on a picture that has none.
         case noMetadata
         /// The packet is in a framing this rewrite does not emit (a 1/2/3-byte length prefix).
         case unsupportedFraming
     }
 
     private static let nalTypeRPU: UInt8 = 62
+    private static let nalTypeEL: UInt8 = 63
     private static let lengthPrefixSize = 4
 
-    private(set) var injectedCount = 0
-    private(set) var standsDown = false
+    private let dropsEnhancementLayer: Bool
+    /// Native HDR10+ is known to exist (from the audit, or seen in an earlier picture): never derive.
+    private(set) var servesNativeHDR10Plus: Bool
+    private(set) var derivedCount = 0
     /// The last L1 an RPU carried. A Dolby Vision RPU states L1 per shot and some encoders omit the block
     /// on frames that repeat it, so a frame without one keeps the shot's value rather than losing HDR10+.
     private var currentLevel1: DolbyVisionHDR10PlusMapping.Level1?
     /// The SEI for `currentLevel1`, rebuilt only when the shot changes.
     private var cachedNAL: (level1: DolbyVisionHDR10PlusMapping.Level1, nal: [UInt8])?
 
+    /// `nativeHDR10Plus` is the audit's answer, nil when there was none (a custom reader, a live source).
+    init(nativeHDR10Plus: DolbyVisionHDR10PlusAudit.Result.NativeHDR10Plus? = nil,
+         dropsEnhancementLayer: Bool = false) {
+        self.dropsEnhancementLayer = dropsEnhancementLayer
+        switch nativeHDR10Plus {
+        case .inBand?, .sideDataOnly?: servesNativeHDR10Plus = true
+        case .absent?, nil: servesNativeHDR10Plus = false
+        }
+    }
+
+    private struct Unit {
+        var start: Int        // offset of the unit's framing (length prefix or start code)
+        var end: Int          // one past its last byte
+        var type: UInt8
+    }
+
     func process(
         _ packet: UnsafeMutablePointer<AVPacket>,
         framing: VideoNALFraming
     ) -> Outcome {
-        if standsDown { return .sourceCarriesHDR10Plus }
         guard let data = packet.pointee.data, packet.pointee.size > 2 else { return .noMetadata }
         let size = Int(packet.pointee.size)
         switch framing {
         case .annexB: break
         case .lengthPrefixed(let width): guard width == Self.lengthPrefixSize else { return .unsupportedFraming }
         }
+        let base = UnsafePointer(data)
 
-        // In-band only: what AVPlayer receives is the bitstream, and packet side data never reaches it.
-        if HDR10PlusMetadataScan.bytesCarryHDR10Plus(data, size: size, codecID: AV_CODEC_ID_HEVC, framing: framing) {
-            standsDown = true
-            return .sourceCarriesHDR10Plus
-        }
-
-        // One walk: the first slice's offset (where the SEI goes) and this access unit's RPU (which
-        // follows the slices, so the insertion point is found before the metadata that fills it).
-        var firstSliceOffset: Int?
+        // One walk: every unit's extent (to drop the enhancement layer and find the first slice) and this
+        // access unit's RPU, which follows the slices.
+        var units: [Unit] = []
+        units.reserveCapacity(8)
         var level1: DolbyVisionHDR10PlusMapping.Level1?
-        A53SEIParser.forEachNAL(data, size, framing) { nal, length in
+        let readsRPU = !servesNativeHDR10Plus
+        A53SEIParser.forEachNAL(base, size, framing) { nal, length in
             guard length >= 2 else { return }
             let type = (nal[0] >> 1) & 0x3F
-            if type < 32, firstSliceOffset == nil {
-                firstSliceOffset = Self.unitStart(of: nal, in: data, framing: framing)
-            } else if type == Self.nalTypeRPU, level1 == nil {
+            let nalOffset = nal - base
+            units.append(Unit(start: Self.unitStart(nalOffset: nalOffset, in: base, framing: framing),
+                              end: nalOffset + length, type: type))
+            if readsRPU, type == Self.nalTypeRPU, level1 == nil {
                 level1 = Self.level1(ofRPU: nal, length: length)
             }
         }
+        // In Annex B a unit runs to the next start code; anything the walk did not reach is kept verbatim.
+        if framing == .annexB {
+            for i in units.indices { units[i].end = i + 1 < units.count ? units[i + 1].start : size }
+        }
         if let level1 { currentLevel1 = level1 }
-        guard let shot = currentLevel1, let insertAt = firstSliceOffset else { return .noMetadata }
 
-        let seiNAL: [UInt8]
-        if let cached = cachedNAL, cached.level1 == shot {
-            seiNAL = cached.nal
+        var outcome: Outcome
+        var sei: [UInt8]?
+        if HDR10PlusMetadataScan.bytesCarryHDR10Plus(base, size: size, codecID: AV_CODEC_ID_HEVC, framing: framing) {
+            servesNativeHDR10Plus = true
+            outcome = .nativeInBand
+        } else if let native = HDR10PlusMetadataScan.sideDataT35Payload(packet) {
+            servesNativeHDR10Plus = true
+            sei = DolbyVisionHDR10PlusMapping.hevcPrefixSEINAL(t35Payload: native)
+            outcome = .nativeFromSideData
+        } else if !servesNativeHDR10Plus, let shot = currentLevel1 {
+            sei = derivedNAL(for: shot)
+            outcome = .derived
         } else {
-            let metadata = DolbyVisionHDR10PlusMapping.metadata(for: shot)
-            seiNAL = DolbyVisionHDR10PlusMapping.hevcPrefixSEINAL(
-                t35Payload: DolbyVisionHDR10PlusMapping.t35Payload(metadata))
-            cachedNAL = (shot, seiNAL)
+            outcome = .noMetadata
         }
 
-        // Both framings take a 4-byte prefix: a length, or the 00 00 00 01 start code.
-        var prefix = [UInt8](repeating: 0, count: Self.lengthPrefixSize)
-        switch framing {
-        case .annexB:
-            prefix[3] = 1
-        case .lengthPrefixed:
-            let n = seiNAL.count
-            prefix = [UInt8((n >> 24) & 0xFF), UInt8((n >> 16) & 0xFF), UInt8((n >> 8) & 0xFF), UInt8(n & 0xFF)]
+        let firstSlice = units.firstIndex { $0.type < 32 }
+        if firstSlice == nil, sei != nil {
+            sei = nil
+            outcome = .noMetadata
         }
-        let added = prefix.count + seiNAL.count
-        let total = size + added
+        let dropsAny = dropsEnhancementLayer && units.contains { $0.type == Self.nalTypeEL }
+        guard sei != nil || dropsAny else { return outcome }
+
+        // Rebuild once: leading bytes, then each unit, the SEI in front of the first slice, the enhancement
+        // layer left out, then whatever trailed the last unit the walk could read.
+        var prefixedSEI: [UInt8] = []
+        if let sei {
+            switch framing {
+            case .annexB:
+                prefixedSEI = [0, 0, 0, 1] + sei
+            case .lengthPrefixed:
+                let n = sei.count
+                prefixedSEI = [UInt8((n >> 24) & 0xFF), UInt8((n >> 16) & 0xFF), UInt8((n >> 8) & 0xFF),
+                               UInt8(n & 0xFF)] + sei
+            }
+        }
+        let seiMarker = -1   // a piece whose bytes are `prefixedSEI`
+        var pieces: [(offset: Int, count: Int)] = []
+        var cursor = 0
+        for (index, unit) in units.enumerated() {
+            if unit.start > cursor { pieces.append((cursor, unit.start - cursor)) }
+            if index == firstSlice, !prefixedSEI.isEmpty { pieces.append((seiMarker, prefixedSEI.count)) }
+            if !(dropsEnhancementLayer && unit.type == Self.nalTypeEL) {
+                pieces.append((unit.start, unit.end - unit.start))
+            }
+            cursor = max(cursor, unit.end)
+        }
+        if cursor < size { pieces.append((cursor, size - cursor)) }
+
+        let total = pieces.reduce(0) { $0 + $1.count }
+        // Degenerate: nothing left but the enhancement layer. Leave the packet rather than emit an empty one.
+        guard total > 0 else { return outcome }
         let pad = Int(AV_INPUT_BUFFER_PADDING_SIZE)
-        guard let newRef = av_buffer_alloc(total + pad), let dst = newRef.pointee.data else {
-            return .noMetadata
+        guard let newRef = av_buffer_alloc(total + pad), let dst = newRef.pointee.data else { return .noMetadata }
+        var written = 0
+        for piece in pieces {
+            if piece.offset == seiMarker {
+                prefixedSEI.withUnsafeBufferPointer { _ = memcpy(dst + written, $0.baseAddress!, $0.count) }
+            } else {
+                memcpy(dst + written, base + piece.offset, piece.count)
+            }
+            written += piece.count
         }
-        memcpy(dst, data, insertAt)
-        prefix.withUnsafeBufferPointer { _ = memcpy(dst + insertAt, $0.baseAddress!, $0.count) }
-        seiNAL.withUnsafeBufferPointer { _ = memcpy(dst + insertAt + prefix.count, $0.baseAddress!, $0.count) }
-        memcpy(dst + insertAt + added, data + insertAt, size - insertAt)
         memset(dst + total, 0, pad)   // decoders read past size
         av_buffer_unref(&packet.pointee.buf)
         packet.pointee.buf = newRef
         packet.pointee.data = newRef.pointee.data
         packet.pointee.size = Int32(total)
-        injectedCount += 1
-        return .injected
+        if outcome == .derived { derivedCount += 1 }
+        return outcome
     }
 
-    /// Offset of the framing that introduces `nal`: its length prefix, or its start code (a 4-byte start
-    /// code when the byte before the 3-byte one is the zero the NAL walk trimmed off the previous unit).
+    private func derivedNAL(for shot: DolbyVisionHDR10PlusMapping.Level1) -> [UInt8] {
+        if let cached = cachedNAL, cached.level1 == shot { return cached.nal }
+        let nal = DolbyVisionHDR10PlusMapping.hevcPrefixSEINAL(
+            t35Payload: DolbyVisionHDR10PlusMapping.t35Payload(DolbyVisionHDR10PlusMapping.metadata(for: shot)))
+        cachedNAL = (shot, nal)
+        return nal
+    }
+
+    /// Offset of the framing that introduces the NAL at `nalOffset`: its length prefix, or its start code (a
+    /// 4-byte one when the byte before the 3-byte code is the zero the NAL walk trimmed off the previous unit).
     private static func unitStart(
-        of nal: UnsafePointer<UInt8>, in data: UnsafePointer<UInt8>, framing: VideoNALFraming
+        nalOffset: Int, in data: UnsafePointer<UInt8>, framing: VideoNALFraming
     ) -> Int {
-        let nalOffset = nal - data
         switch framing {
         case .lengthPrefixed(let width):
             return max(nalOffset - width, 0)
