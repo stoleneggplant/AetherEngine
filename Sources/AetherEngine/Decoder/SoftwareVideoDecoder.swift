@@ -506,6 +506,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     /// Serialise HDR10+ dynamic metadata from AVFrame side data to T.35 SEI bytes (kCMSampleAttachmentKey_HDR10PlusPerFrameData).
     /// Returns nil when the frame carries no AV_FRAME_DATA_DYNAMIC_HDR_PLUS side data.
+    ///
+    /// CoreMedia requires the attachment to start at `itu_t_t35_country_code` (0xB5), while
+    /// `av_dynamic_hdr_plus_to_t35` writes from the application mode on, after the six header bytes
+    /// (country code, provider code, provider-oriented code, application identifier). The header goes back
+    /// in front; without it the attachment does not parse as HDR10+.
     private func extractHDR10PlusBytes(
         from frame: UnsafeMutablePointer<AVFrame>
     ) -> Data? {
@@ -525,7 +530,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 var size: Int = 0
                 let result = av_dynamic_hdr_plus_to_t35(recordPtr, &dataPtr, &size)
                 guard result >= 0, let buf = dataPtr, size > 0 else { return nil }
-                let data = Data(bytes: buf, count: size)
+                var data = Data([0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04])
+                data.append(buf, count: size)
                 av_free(buf)  // use av_free, not plain free(): libavutil allocator contract
                 return data
             }
