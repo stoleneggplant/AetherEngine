@@ -102,7 +102,16 @@ extension AetherEngine {
             // The proposal's handling against the loaded source's base layer: a correction that turns
             // the base layer on and moves to software in one step is honoured, one that keeps the
             // Dolby Vision on a Profile 5 record is refused as before.
-            presentsDolbyVisionBaseLayer: proposed.dolbyVisionHandling == .baseLayerOnly
+            // A session converting to HDR10+ presents the base layer (it routes as `.baseLayerOnly`), and
+            // whether it converts is decided against the table the load routed on (AE#535), not a second
+            // read. This guard is only about the IPT-only class, which neither route presents.
+            presentsDolbyVisionBaseLayer: (proposed.dolbyVisionHandling == .baseLayerOnly
+                || (proposed.convertsDolbyVisionToHDR10Plus
+                    && VideoRoutingPolicy.platformConvertsDolbyVisionToHDR10Plus
+                    && !Self.reloadDisplayCapabilities(
+                        observedAtLoad: sessionObservedDisplayCaps,
+                        hostAssertsDolbyVision: proposed.panelPresentsDolbyVision,
+                        readNow: { Self.displayCapabilities }).supportsDolbyVision))
                 && sourceDolbyVisionBaseLayerPresentable,
             isLive: loadedOptions.isLive,
             hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
@@ -397,7 +406,7 @@ enum SessionOptionCorrection {
     static let knownFields: [String] = [
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling",
-        "preferDualLayerDolbyVision", "matchContentEnabled",
+        "convertsDolbyVisionToHDR10Plus", "preferDualLayerDolbyVision", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
         "dvrWindowSeconds",

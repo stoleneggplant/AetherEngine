@@ -12,6 +12,19 @@ the public-API contract.
 
 ### Added
 
+- **Dolby Vision to HDR10+ for displays without Dolby Vision (`LoadOptions.convertsDolbyVisionToHDR10Plus`).**
+  An HDR10+ TV without Dolby Vision used to get one static HDR10 grade for a whole Dolby Vision title. With
+  this option, on tvOS and iOS, such a display gets the title's HDR10 base layer with per-picture HDR10+
+  (ST 2094-40, Profile A): the source's own HDR10+ where it has any (in-band, or Matroska side data
+  serialized into the bitstream), otherwise derived from the RPU, L1 (with CM v4.0 L3) supplying the
+  peak and, through a modelled maxRGB distribution, the average and percentiles. A bounded second open
+  at load finds the source's own HDR10+ before the first picture and reads the RPU's Level 6, which fills
+  in `mdcv` / `clli` when the base layer's container states none. A Profile 7 enhancement layer is dropped
+  from the samples, and trick-play (I-frame) renditions carry the same HDR10+. HEVC Profile 7, 8.1 and a
+  Profile 5 record over a PQ YCbCr VUI; a display with Dolby Vision keeps Dolby Vision; inert on macOS,
+  which cannot tell a display without Dolby Vision from one it was not told about. The mapping and its
+  references (dovi_tool, libplacebo, hdr10plus_tool) are in
+  [formats.md](docs/formats.md#dolby-vision-to-hdr10). `aetherctl` takes it as `--dv-hdr10plus`.
 - **Dolby Vision Profile 7 FEL can play dual-layer (opt-in, AE#702).** The Profile 7 to 8.1 conversion
   keeps the RPU and discards the enhancement layer, which for a Full Enhancement Layer loses the
   residual the picture was mastered with. With `LoadOptions.preferDualLayerDolbyVision = true`, a display

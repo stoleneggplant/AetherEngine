@@ -42,7 +42,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     let sourceURL: URL
     let sourceHTTPHeaders: [String: String]
-    private let dvModeAvailable: Bool
+    let dvModeAvailable: Bool
 
     /// From `LoadOptions.keepDvh1TagWithoutDV`; default OFF, set only for misreporting DV panels.
     private let keepDvh1TagWithoutDV: Bool
@@ -55,6 +55,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Vision source with a presentable base layer down the plain hvc1 / av01 route on every display
     /// (`VideoRoutingPolicy.presentsDolbyVisionBaseLayer`), ahead of every DV branch including AE#455.
     let dolbyVisionHandling: DolbyVisionHandling
+
+    /// From `LoadOptions.convertsDolbyVisionToHDR10Plus`, with the platform gate already applied by the
+    /// caller; default false. Resolved per source in `resolveCodecRoute`
+    /// (`VideoRoutingPolicy.synthesizesHDR10PlusFromDolbyVision`).
+    let convertsDolbyVisionToHDR10Plus: Bool
+
+    /// What the load read from the source for that conversion (`DolbyVisionHDR10PlusAudit`): its own HDR10+
+    /// and the RPU's static HDR10 metadata. nil when no audit ran (a custom reader, live, or the option off).
+    let dolbyVisionHDR10PlusAudit: DolbyVisionHDR10PlusAudit.Result?
 
     /// AE#532: the profile this source's own RPU reports, when the container record was worth doubting
     /// (`DolbyVisionRecordAudit`). nil when nothing was read, which is every source but a Profile 5
@@ -972,6 +981,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        convertsDolbyVisionToHDR10Plus: Bool = false,
+        dolbyVisionHDR10PlusAudit: DolbyVisionHDR10PlusAudit.Result? = nil,
         dolbyVisionRPUProfile: Int? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
@@ -1024,6 +1035,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.convertsDolbyVisionToHDR10Plus = convertsDolbyVisionToHDR10Plus
+        self.dolbyVisionHDR10PlusAudit = dolbyVisionHDR10PlusAudit
         self.dolbyVisionRPUProfile = dolbyVisionRPUProfile
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
@@ -1626,6 +1639,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "codecpar copy failed")
         }
         ownedCodecParams.append(ownedVideoParams)
+        // A base layer converted to HDR10+ with no HDR10 static metadata in its own container gets the RPU's
+        // Level 6 instead, so the TV reads a mastering peak and MaxCLL beside the dynamic metadata. The
+        // muxer writes the side data as `mdcv` / `clli`; what the container already states is kept.
+        if route.synthesizesHDR10Plus, let fallback = dolbyVisionHDR10PlusAudit?.staticMetadata {
+            let added = DolbyVisionHDR10PlusAudit.attachStaticMetadata(fallback, to: ownedVideoParams.ptr)
+            if added.masteringDisplay || added.contentLight {
+                EngineLog.emit(
+                    "[HLSVideoEngine] HDR10 static metadata from the DV RPU's L6 (the container states "
+                    + "none): mdcv=\(added.masteringDisplay) clli=\(added.contentLight) "
+                    + "peak=\(Int(fallback.maxMasteringLuminance)) nits MaxCLL=\(fallback.maxCLL) "
+                    + "MaxFALL=\(fallback.maxFALL)",
+                    category: .session)
+            }
+        }
         // movenc writes `pasp` from the output codecpar alone, and a container-declared ratio never
         // reaches codecpar: Matroska's DisplayWidth quotient and MP4's own `pasp` land on AVStream
         // (matroskadec.c / mov.c), which is where a DVD remuxed to MKV carries its anamorphic ratio.
@@ -1661,6 +1688,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             codecTagOverride: codecTagOverride,
             doviConfig: doviConfig,
             convertP7ToProfile81: convertP7ToProfile81,
+            synthesizeHDR10PlusFromRPU: route.synthesizesHDR10Plus,
+            nativeHDR10Plus: route.synthesizesHDR10Plus ? dolbyVisionHDR10PlusAudit?.nativeHDR10Plus : nil,
+            dropsEnhancementLayer: route.synthesizesHDR10Plus && dvVariant == .profile7,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
             nalFramingOverride: measuredVideoNALFraming,
@@ -2764,6 +2794,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             },
             cleanup: { custom?.reader.close() },
             convertP7ToProfile81: cfg.convertP7ToProfile81,
+            hdr10Plus: cfg.synthesizeHDR10PlusFromRPU
+                ? IFrameSideReader.HDR10PlusRewrite(
+                    nativeHDR10Plus: cfg.nativeHDR10Plus, dropsEnhancementLayer: cfg.dropsEnhancementLayer)
+                : nil,
             nalFraming: framing)
         let entries = plan.map {
             IFrameRendition.Entry(startPts: $0.startPts, startSeconds: $0.startSeconds,

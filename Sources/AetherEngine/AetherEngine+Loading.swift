@@ -758,6 +758,8 @@ extension AetherEngine {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        convertsDolbyVisionToHDR10Plus: Bool = false,
+        dolbyVisionHDR10PlusAudit: DolbyVisionHDR10PlusAudit.Result? = nil,
         dolbyVisionRPUProfile: Int? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
@@ -832,6 +834,10 @@ extension AetherEngine {
             keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,
             forceDolbyVisionOnNonDVDisplay: forceDolbyVisionOnNonDVDisplay,
             dolbyVisionHandling: dolbyVisionHandling,
+            // The platform gate lives here, so the load's format clamp and the served route agree.
+            convertsDolbyVisionToHDR10Plus: convertsDolbyVisionToHDR10Plus
+                && VideoRoutingPolicy.platformConvertsDolbyVisionToHDR10Plus,
+            dolbyVisionHDR10PlusAudit: dolbyVisionHDR10PlusAudit,
             dolbyVisionRPUProfile: dolbyVisionRPUProfile,
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
@@ -2576,6 +2582,10 @@ extension AetherEngine {
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     forceDolbyVisionOnNonDVDisplay: loadedOptions.forceDolbyVisionOnNonDVDisplay,
                     dolbyVisionHandling: loadedOptions.dolbyVisionHandling,
+                    convertsDolbyVisionToHDR10Plus: loadedOptions.convertsDolbyVisionToHDR10Plus,
+                    // The load's audit: the source has not changed and its probe is gone. A session that
+                    // turned the conversion on in place has none and decides HDR10+ per packet.
+                    dolbyVisionHDR10PlusAudit: sourceDolbyVisionHDR10PlusAudit,
                     // AE#532: the verdict the load reached, not a second audit: the source has not
                     // changed and the probe that could answer it is gone.
                     dolbyVisionRPUProfile: sourceDolbyVisionRPUProfile,

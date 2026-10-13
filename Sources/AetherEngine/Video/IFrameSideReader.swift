@@ -9,6 +9,7 @@ final class IFrameSideReader: @unchecked Sendable {
     private let open: (Demuxer) throws -> Void
     private let cleanup: () -> Void
     private let convertP7ToProfile81: Bool
+    private let hdr10Plus: HDR10PlusRewrite?
     private let nalFraming: VideoNALFraming
     private let readDeadlineSeconds: TimeInterval
     private let now: () -> Date
@@ -35,15 +36,24 @@ final class IFrameSideReader: @unchecked Sendable {
 
     /// `open` receives a demuxer that `interrupt()` can already reach, so a slow open is abortable.
     /// `cleanup` runs once, from `close()`, whether or not the demuxer was ever opened.
+    /// The session's Dolby Vision to HDR10+ rewrite, so a trick-play picture carries the HDR10+ its
+    /// segment counterpart does. Each keyframe gets a fresh synthesizer: its own RPU states its shot.
+    struct HDR10PlusRewrite {
+        var nativeHDR10Plus: DolbyVisionHDR10PlusAudit.Result.NativeHDR10Plus?
+        var dropsEnhancementLayer: Bool
+    }
+
     init(open: @escaping (Demuxer) throws -> Void,
          cleanup: @escaping () -> Void = {},
          convertP7ToProfile81: Bool = false,
+         hdr10Plus: HDR10PlusRewrite? = nil,
          nalFraming: VideoNALFraming = .lengthPrefixed(size: 4),
          readDeadlineSeconds: TimeInterval = 8,
          now: @escaping () -> Date = Date.init) {
         self.open = open
         self.cleanup = cleanup
         self.convertP7ToProfile81 = convertP7ToProfile81
+        self.hdr10Plus = hdr10Plus
         self.nalFraming = nalFraming
         self.readDeadlineSeconds = readDeadlineSeconds
         self.now = now
@@ -150,6 +160,12 @@ final class IFrameSideReader: @unchecked Sendable {
                   (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0 else { continue }
             if convertP7ToProfile81 {
                 _ = DoviRpuConverter.convertPacketToProfile81(packet, framing: nalFraming)
+            }
+            if let hdr10Plus {
+                _ = DolbyVisionHDR10PlusSynthesizer(
+                    nativeHDR10Plus: hdr10Plus.nativeHDR10Plus,
+                    dropsEnhancementLayer: hdr10Plus.dropsEnhancementLayer
+                ).process(packet, framing: nalFraming)
             }
             guard let bytes = packet.pointee.data, packet.pointee.size > 0 else { return nil }
             return Data(bytes: bytes, count: Int(packet.pointee.size))

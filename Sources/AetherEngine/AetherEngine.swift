@@ -594,6 +594,10 @@ public final class AetherEngine: ObservableObject {
     /// source after the probe that measured it is gone.
     var sourceDolbyVisionRPUProfile: Int? = nil
 
+    /// What the load read for `convertsDolbyVisionToHDR10Plus` (`DolbyVisionHDR10PlusAudit`): the source's
+    /// own HDR10+ and the RPU's static metadata. Held, like `sourceDolbyVisionRPUProfile`, because an
+    /// in-place rebuild routes without a probe. nil when the load ran no audit.
+    var sourceDolbyVisionHDR10PlusAudit: DolbyVisionHDR10PlusAudit.Result? = nil
     /// This session composes a Dolby Vision Profile 7 FEL on the software host (`DolbyVisionFELPolicy`).
     /// Decided by `load` and kept across in-place rebuilds, which reach `loadSoftware` without routing.
     var sourceComposesDolbyVisionFEL = false
@@ -4242,6 +4246,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceDolbyVisionHDR10PlusAudit = nil
         sourceComposesDolbyVisionFEL = false
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
@@ -4318,6 +4323,10 @@ public final class AetherEngine: ObservableObject {
         // format clamp, the criteria request and the software-path guard below all read.
         var detectedDVBaseLayerPresentable = false
         var presentsDolbyVisionBaseLayer = false
+        // `convertsDolbyVisionToHDR10Plus` resolved against this source and display, and what the
+        // conversion reads from the source before the first segment (`DolbyVisionHDR10PlusAudit`).
+        var detectedSynthesizesHDR10Plus = false
+        var detectedHDR10PlusAudit: DolbyVisionHDR10PlusAudit.Result? = nil
         // AE#532: what this source's own RPU says, and the profile the route should believe instead of
         // the record. Both stay nil for every source but a Profile 5 record over a BT.2020 YCbCr HDR VUI.
         var detectedDVRPUProfile: Int? = nil
@@ -4428,7 +4437,20 @@ public final class AetherEngine: ObservableObject {
                     dvBlCompatID: detectedDVBLCompatIDNum,
                     colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                     colorMatrix: stream.pointee.codecpar.pointee.color_space)
-                presentsDolbyVisionBaseLayer = options.dolbyVisionHandling == .baseLayerOnly
+                // `convertsDolbyVisionToHDR10Plus`: a session that synthesizes routes as `.baseLayerOnly`.
+                // The session's display table answers the Dolby Vision half, the same table
+                // `HLSVideoEngine` routes on (`dvModeAvailable`).
+                detectedSynthesizesHDR10Plus = VideoRoutingPolicy.synthesizesHDR10PlusFromDolbyVision(
+                    requested: options.convertsDolbyVisionToHDR10Plus,
+                    displayPresentsDolbyVision: sessionDisplayCaps.supportsDolbyVision,
+                    codecID: detectedCodecID,
+                    dvProfile: detectedDVProfileNum,
+                    dvBlCompatID: detectedDVBLCompatIDNum,
+                    colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+                    colorMatrix: stream.pointee.codecpar.pointee.color_space)
+                let routedDVHandling = VideoRoutingPolicy.routedDolbyVisionHandling(
+                    requested: options.dolbyVisionHandling, synthesizesHDR10Plus: detectedSynthesizesHDR10Plus)
+                presentsDolbyVisionBaseLayer = routedDVHandling == .baseLayerOnly
                     && detectedDVBaseLayerPresentable
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
@@ -4455,6 +4477,49 @@ public final class AetherEngine: ObservableObject {
                               + (detectedDVRPUProfile.map { "reads profile \($0)" } ?? "could not be read")
                               + "; the record stands"),
                         category: .engine)
+                }
+                // A second, bounded open, paid only by a session that converts: whether the source has HDR10+
+                // of its own (served instead of anything derived, from the first picture), and the RPU's L6
+                // (the static fallback for a base layer whose container states none). `.url` VOD only: a
+                // custom reader has no second open and live is not a class this reads; both decide HDR10+
+                // per packet instead.
+                if detectedSynthesizesHDR10Plus, case .url(let auditURL) = source, !options.isLive {
+                    let auditHeaders = options.httpHeaders
+                    detectedHDR10PlusAudit = await BlockingWork.detached(priority: .userInitiated) {
+                        DolbyVisionHDR10PlusAudit.inspect(url: auditURL, extraHeaders: auditHeaders)
+                    }.value
+                    let native: String
+                    switch detectedHDR10PlusAudit?.nativeHDR10Plus {
+                    case .inBand?: native = "own HDR10+ SEI (served as it is)"
+                    case .sideDataOnly?: native = "own HDR10+ as side data (serialized into the bitstream)"
+                    case .absent?: native = "no HDR10+ of its own (derived from the RPU)"
+                    case nil: native = "unread (decided per packet)"
+                    }
+                    EngineLog.emit(
+                        "[AetherEngine] DV->HDR10+ audit: \(native), RPU L6 "
+                        + (detectedHDR10PlusAudit?.staticMetadata.map {
+                            "peak=\(Int($0.maxMasteringLuminance)) MaxCLL=\($0.maxCLL)"
+                        } ?? "absent"),
+                        category: .engine)
+                }
+                if options.convertsDolbyVisionToHDR10Plus, detectedFormat == .dolbyVision {
+                    let profile = detectedDVProfileNum ?? 0
+                    let compat = detectedDVBLCompatIDNum ?? 0
+                    let outcome: String
+                    if detectedSynthesizesHDR10Plus {
+                        outcome = "DV Profile \(profile) on a display without Dolby Vision presents its HDR10 base "
+                            + "layer with HDR10+"
+                    } else if !VideoRoutingPolicy.platformConvertsDolbyVisionToHDR10Plus {
+                        outcome = "inert on this platform (no per-mode display table to prove the display "
+                            + "lacks Dolby Vision)"
+                    } else if sessionDisplayCaps.supportsDolbyVision {
+                        outcome = "not converting, the display presents Dolby Vision"
+                    } else {
+                        outcome = "not converting, DV Profile \(profile) compat=\(compat) has no HEVC PQ base "
+                            + "layer to carry HDR10+"
+                    }
+                    EngineLog.emit(
+                        "[AetherEngine] convertsDolbyVisionToHDR10Plus: \(outcome)", category: .engine)
                 }
                 if options.dolbyVisionHandling == .baseLayerOnly, detectedFormat == .dolbyVision {
                     EngineLog.emit(
@@ -4632,6 +4697,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = detectedDVBLCompatIDNum
         sourceDolbyVisionBaseLayerPresentable = detectedDVBaseLayerPresentable
         sourceDolbyVisionRPUProfile = detectedDVRPUProfile
+        sourceDolbyVisionHDR10PlusAudit = detectedHDR10PlusAudit
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
         sourceVideoStreamFormat = detectedVideoStreamFormat
@@ -5317,6 +5383,8 @@ public final class AetherEngine: ObservableObject {
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
                     forceDolbyVisionOnNonDVDisplay: options.forceDolbyVisionOnNonDVDisplay,
                     dolbyVisionHandling: options.dolbyVisionHandling,
+                    convertsDolbyVisionToHDR10Plus: options.convertsDolbyVisionToHDR10Plus,
+                    dolbyVisionHDR10PlusAudit: detectedHDR10PlusAudit,
                     dolbyVisionRPUProfile: detectedDVRPUProfile,
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: routingPanelHDR,
@@ -6497,6 +6565,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
+        sourceDolbyVisionHDR10PlusAudit = nil
         sourceComposesDolbyVisionFEL = false
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil

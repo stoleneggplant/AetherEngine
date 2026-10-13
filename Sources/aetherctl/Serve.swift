@@ -5,6 +5,7 @@ import AetherEngine
 
 func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
               dolbyVisionHandling: DolbyVisionHandling = .automatic,
+              convertsDolbyVisionToHDR10Plus: Bool = false,
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
               audioDelayMs: Int = 0, iFrames: Bool = false,
               objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil) -> Never {
@@ -20,6 +21,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
     if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
     if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
+    if convertsDolbyVisionToHDR10Plus { flagSuffix += " [--dv-hdr10plus]" }
     if let idx = nativeSubsIndex { flagSuffix += " [--native-subs \(idx)]" }
     if let pos = startPosition { flagSuffix += " [--start-position \(pos)]" }
     if audioDelayMs != 0 { flagSuffix += " [--audio-delay \(audioDelayMs)]" }
@@ -34,6 +36,8 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
         dvModeAvailable: dvModeAvailable,
         forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
         dolbyVisionHandling: dolbyVisionHandling,
+        convertsDolbyVisionToHDR10Plus: convertsDolbyVisionToHDR10Plus,
+        dolbyVisionHDR10PlusAudit: convertsDolbyVisionToHDR10Plus ? DolbyVisionHDR10PlusAudit.inspect(url: url) : nil,
         // AE#532: a session gates this on its own probe; the harness has none, so it asks the audit
         // for the whole verdict. A source with nothing to correct never gets past the gate inside.
         dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url),
@@ -94,7 +98,8 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
 // MARK: - validate
 
 func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
-                 dolbyVisionHandling: DolbyVisionHandling = .automatic) -> Int32 {
+                 dolbyVisionHandling: DolbyVisionHandling = .automatic,
+                 convertsDolbyVisionToHDR10Plus: Bool = false) -> Int32 {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -107,6 +112,7 @@ func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = 
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
     if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
     if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
+    if convertsDolbyVisionToHDR10Plus { flagSuffix += " [--dv-hdr10plus]" }
     print(EngineLog.redacted("aetherctl validate: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
@@ -115,6 +121,8 @@ func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = 
         dvModeAvailable: dvModeAvailable,
         forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
         dolbyVisionHandling: dolbyVisionHandling,
+        convertsDolbyVisionToHDR10Plus: convertsDolbyVisionToHDR10Plus,
+        dolbyVisionHDR10PlusAudit: convertsDolbyVisionToHDR10Plus ? DolbyVisionHDR10PlusAudit.inspect(url: url) : nil,
         dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url)
     )
     let playbackURL: URL

@@ -260,6 +260,29 @@ enum HDR10PlusMetadataScan {
         return body[bodySize - 1] & UInt8((1 << padding) - 1) == 0
     }
 
+    /// The HDR10+ a packet carries only as side data (a Matroska BlockAddition, which FFmpeg hands on parsed
+    /// and never as bitstream), serialized back into a complete `user_data_registered_itu_t_t35` payload from
+    /// the country code on: the form an HEVC SEI carries. nil when the packet has none, or what it has does
+    /// not validate; FFmpeg's serializer is not a validator, so nothing unvalidated reaches it.
+    static func sideDataT35Payload(_ packet: UnsafePointer<AVPacket>) -> [UInt8]? {
+        var size = 0
+        guard let sideData = av_packet_get_side_data(packet, AV_PKT_DATA_DYNAMIC_HDR10_PLUS, &size),
+              validSideData(sideData, size: size) else { return nil }
+        var allocationSize = 0
+        guard let metadata = av_dynamic_hdr_plus_alloc(&allocationSize), allocationSize == size else { return nil }
+        defer { av_free(metadata) }
+        memcpy(metadata, sideData, size)
+        var buffer: UnsafeMutablePointer<UInt8>?
+        var bufferSize = 0
+        // `av_dynamic_hdr_plus_to_t35` writes from the application mode on (FFmpeg's own docs), the same
+        // body `av_dynamic_hdr_plus_from_t35` reads, so the six header bytes go back in front.
+        guard av_dynamic_hdr_plus_to_t35(metadata, &buffer, &bufferSize) >= 0, let buffer, bufferSize > 0 else {
+            return nil
+        }
+        defer { av_free(buffer) }
+        return t35Header + Array(UnsafeBufferPointer(start: buffer, count: bufferSize))
+    }
+
     private static func validSideData(_ bytes: UnsafePointer<UInt8>, size: Int) -> Bool {
         var allocationSize = 0
         guard let metadata = av_dynamic_hdr_plus_alloc(&allocationSize) else { return false }

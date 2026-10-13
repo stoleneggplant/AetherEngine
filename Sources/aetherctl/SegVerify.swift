@@ -12,12 +12,16 @@ import AetherEngine
 func runSegVerify(url: URL, from: Int, count: Int, dvModeAvailable: Bool,
                   forceDVWithoutDisplay: Bool = false,
                   dolbyVisionHandling: DolbyVisionHandling = .automatic,
+                  convertsDolbyVisionToHDR10Plus: Bool = false,
                   dumpDir: String? = nil) -> Int32 {
     setvbuf(stdout, nil, _IONBF, 0)   // unbuffered: progressive output survives a long-running run
     print(EngineLog.redacted("segverify: starting engine for \(url.absoluteString)"))
     let engine = HLSVideoEngine(url: url, dvModeAvailable: dvModeAvailable,
                                 forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
                                 dolbyVisionHandling: dolbyVisionHandling,
+                                convertsDolbyVisionToHDR10Plus: convertsDolbyVisionToHDR10Plus,
+                                dolbyVisionHDR10PlusAudit: convertsDolbyVisionToHDR10Plus
+                                    ? DolbyVisionHDR10PlusAudit.inspect(url: url) : nil,
                                 dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url))
     let playbackURL: URL
     do {

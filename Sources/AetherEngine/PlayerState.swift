@@ -449,6 +449,24 @@ public struct LoadOptions: Sendable, Equatable {
     /// contradicts.
     public var dolbyVisionHandling: DolbyVisionHandling
 
+    /// Convert Dolby Vision to HDR10+ for a display without Dolby Vision. Default `false`.
+    ///
+    /// An HDR10+ TV without Dolby Vision (most Samsung panels) otherwise receives a Dolby Vision title's
+    /// HDR10 base layer and one static grade for the whole film. With this set, on such a display, an HEVC
+    /// Profile 7 / 8.1 source (or a Profile 5 record over a BT.2020 YCbCr PQ VUI) is served as its HDR10
+    /// base layer, routed as `.baseLayerOnly` routes it, with one HDR10+ (ST 2094-40, Profile A) SEI per
+    /// picture derived from that picture's RPU (`DolbyVisionHDR10PlusMapping` documents the mapping and its
+    /// references). The source's own HDR10+, when it has any, is served instead and nothing is derived; a
+    /// Profile 7 enhancement layer is dropped from the samples; and when the base layer carries no static
+    /// HDR10 metadata of its own, the RPU's Level 6 supplies it.
+    ///
+    /// A display that presents Dolby Vision keeps Dolby Vision. tvOS and iOS only: macOS cannot tell a
+    /// display without Dolby Vision from one it was not told about, so the option is inert there. Profile
+    /// 8.4 (HLG), 8.2 (SDR), a genuine Profile 5 and AV1 keep their route. Combines with
+    /// `dolbyVisionHandling`: under `.baseLayerOnly` the base layer is served everywhere and this adds the
+    /// HDR10+ where the display has no Dolby Vision. A tuning field, correctable through
+    /// `reloadAtCurrentPosition(applying:)`.
+    public var convertsDolbyVisionToHDR10Plus: Bool
     /// Opt in to dual-layer playback of a Dolby Vision Profile 7 source with a Full Enhancement Layer
     /// (FEL). Default `false`: every Profile 7 is converted to single-layer Profile 8.1 on the native
     /// path, which keeps the RPU and discards the enhancement layer.
@@ -951,6 +969,7 @@ public struct LoadOptions: Sendable, Equatable {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        convertsDolbyVisionToHDR10Plus: Bool = false,
         preferDualLayerDolbyVision: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
@@ -1002,6 +1021,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.convertsDolbyVisionToHDR10Plus = convertsDolbyVisionToHDR10Plus
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
