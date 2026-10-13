@@ -67,11 +67,11 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
-      aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer | --dv-hdr10plus] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] <url>
+      aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer | --dv-hdr10plus] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
-                 [--assert-dv] [--dv-base-layer]
+                 [--assert-dv] [--dv-base-layer | --dv-hdr10plus]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
@@ -103,7 +103,7 @@ func printUsage() {
                       --sequential-origin declares a fake-range origin (one unranged
                       GET, no ranged probes) and needs --declared-duration on VOD
                       since the tail estimate is skipped)
-      aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dv-base-layer] [--dump <dir>] <url>
+      aetherctl segverify [--from N] [--count K] [--no-dv] [--force-dv] [--dv-base-layer | --dv-hdr10plus] [--dump <dir>] <url>
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest [--out PATH.hevc] <file>
@@ -159,6 +159,13 @@ func printUsage() {
                      record over a BT.2020 YCbCr VUI (a relabelled P7 /
                      P8 remux); a genuine P5 has no base layer and keeps
                      its route. Also accepted by `play`.
+      --dv-hdr10plus LoadOptions.dolbyVisionHandling =
+                     .hdr10PlusOnNonDVDisplay: on a display without
+                     Dolby Vision (pair with --no-dv), serve an HEVC
+                     P7 / P8.1 source as its HDR10 base layer with one
+                     HDR10+ (ST 2094-40) SEI per picture, derived from
+                     the RPU's L1. A DV display keeps Dolby Vision.
+                     Also accepted by `play` and `segverify`.
 
     Flags (play only):
       --assert-dv    AE#493: set LoadOptions.panelPresentsDolbyVision,
@@ -343,7 +350,7 @@ if first == "segverify" {
     let count   = takeIntFlag("--count", in: 0...1_000_000, from: &rest) ?? 12
     let noDV    = takeFlag("--no-dv", from: &rest)
     let forceDV = takeFlag("--force-dv", from: &rest)
-    let dvBaseLayer = takeFlag("--dv-base-layer", from: &rest)
+    let dvHandling = takeDolbyVisionHandlingFlag(from: &rest)
     let dumpDir = takeStringFlag("--dump", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: segverify requires a <url> argument")
@@ -353,7 +360,7 @@ if first == "segverify" {
     rejectStrayFlags(rest, subcommand: "segverify")
     exit(runSegVerify(url: parseSourceURL(urlArg), from: fromIdx, count: count, dvModeAvailable: !noDV,
                       forceDVWithoutDisplay: forceDV,
-                      dolbyVisionHandling: dvBaseLayer ? .baseLayerOnly : .automatic,
+                      dolbyVisionHandling: dvHandling,
                       dumpDir: dumpDir))
 }
 
@@ -649,7 +656,8 @@ if first == "play" {
     let playAssertDV = takeFlag("--assert-dv", from: &rest)
     // `LoadOptions.dolbyVisionHandling = .baseLayerOnly`: the base layer of a Dolby Vision source, the
     // Dolby Vision left out of the container. The harness for a record the bitstream contradicts.
-    let playDVHandling: DolbyVisionHandling = takeFlag("--dv-base-layer", from: &rest) ? .baseLayerOnly : .automatic
+    // `--dv-hdr10plus`: `.hdr10PlusOnNonDVDisplay`, the base layer with HDR10+ synthesized from the RPU.
+    let playDVHandling = takeDolbyVisionHandlingFlag(from: &rest)
     // AE#560: record the live source to a file from the session's existing connection.
     let playRecord = takeStringFlag("--record", from: &rest).map { URL(fileURLWithPath: $0) }
     // AE#492: `LoadOptions.deinterlaceFieldRate`. `send_field` (the default) emits one frame per
@@ -911,7 +919,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // AE#455: opt-in P8.1-as-P5 routing, which only has an effect alongside --no-dv.
     let forceDV = takeFlag("--force-dv", from: &rest)
     // The base layer of a Dolby Vision source, the Dolby Vision left out of the container.
-    let dvHandling: DolbyVisionHandling = takeFlag("--dv-base-layer", from: &rest) ? .baseLayerOnly : .automatic
+    let dvHandling = takeDolbyVisionHandlingFlag(from: &rest)
     let framesOverride = takeIntFlag("--frames", from: &rest)
     let atSeconds = takeDoubleFlag("--at", from: &rest) ?? 60.0
     let extractLoops = takeIntFlag("--loops", from: &rest) ?? 1

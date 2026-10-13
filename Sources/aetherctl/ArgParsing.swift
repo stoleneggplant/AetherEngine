@@ -1,12 +1,25 @@
 // Shared CLI argument helpers for every aetherctl subcommand.
 
 import Foundation
+import AetherEngine
 
 /// Remove a boolean flag from `rest` in place; returns whether it was present.
 func takeFlag(_ name: String, from rest: inout [String]) -> Bool {
     guard let idx = rest.firstIndex(of: name) else { return false }
     rest.remove(at: idx)
     return true
+}
+
+/// `--dv-base-layer` (`.baseLayerOnly`) or `--dv-hdr10plus` (`.hdr10PlusOnNonDVDisplay`), removed from `rest`.
+/// Exits 64 when both are given: they ask for different things on a display without Dolby Vision.
+func takeDolbyVisionHandlingFlag(from rest: inout [String]) -> DolbyVisionHandling {
+    let baseLayer = takeFlag("--dv-base-layer", from: &rest)
+    let hdr10Plus = takeFlag("--dv-hdr10plus", from: &rest)
+    if baseLayer && hdr10Plus {
+        print("ERROR: --dv-base-layer and --dv-hdr10plus are mutually exclusive")
+        exit(64)
+    }
+    return hdr10Plus ? .hdr10PlusOnNonDVDisplay : baseLayer ? .baseLayerOnly : .automatic
 }
 
 /// Remove `--key value` from `rest`, returning the Int value. Exits 64 if the flag is present but the value is missing or non-integer.

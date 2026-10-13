@@ -20,6 +20,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
     if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
     if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
+    if dolbyVisionHandling == .hdr10PlusOnNonDVDisplay { flagSuffix += " [--dv-hdr10plus]" }
     if let idx = nativeSubsIndex { flagSuffix += " [--native-subs \(idx)]" }
     if let pos = startPosition { flagSuffix += " [--start-position \(pos)]" }
     if audioDelayMs != 0 { flagSuffix += " [--audio-delay \(audioDelayMs)]" }
@@ -107,6 +108,7 @@ func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = 
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
     if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
     if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
+    if dolbyVisionHandling == .hdr10PlusOnNonDVDisplay { flagSuffix += " [--dv-hdr10plus]" }
     print(EngineLog.redacted("aetherctl validate: \(url.absoluteString)\(flagSuffix)"))
     print("")
 

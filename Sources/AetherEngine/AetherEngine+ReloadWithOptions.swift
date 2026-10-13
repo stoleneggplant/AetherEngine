@@ -102,7 +102,12 @@ extension AetherEngine {
             // The proposal's handling against the loaded source's base layer: a correction that turns
             // the base layer on and moves to software in one step is honoured, one that keeps the
             // Dolby Vision on a Profile 5 record is refused as before.
-            presentsDolbyVisionBaseLayer: proposed.dolbyVisionHandling == .baseLayerOnly
+            // `.hdr10PlusOnNonDVDisplay` presents the base layer wherever the display has no Dolby Vision
+            // (it routes as `.baseLayerOnly` there); this guard is only about the IPT-only class, which
+            // neither handling presents.
+            presentsDolbyVisionBaseLayer: (proposed.dolbyVisionHandling == .baseLayerOnly
+                || (proposed.dolbyVisionHandling == .hdr10PlusOnNonDVDisplay
+                    && !Self.displayCapabilities.supportsDolbyVision))
                 && sourceDolbyVisionBaseLayerPresentable,
             isLive: loadedOptions.isLive,
             hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil

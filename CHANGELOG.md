@@ -10,6 +10,17 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **Dolby Vision to HDR10+ on displays without Dolby Vision (`DolbyVisionHandling.hdr10PlusOnNonDVDisplay`).**
+  An HDR10+ TV without Dolby Vision used to get one static HDR10 grade for a whole Dolby Vision title. With
+  this handling it gets the title's HDR10 base layer plus per-shot HDR10+ (ST 2094-40, Profile A) metadata
+  derived from the RPU: L1 (with CM v4.0 L3 applied) supplies the peak (MaxSCL and the 99.98th percentile)
+  and, through a modelled maxRGB distribution, the linear average and the percentiles. HEVC Profile 7, 8.1
+  and a Profile 5 record over a PQ YCbCr VUI; a display with Dolby Vision keeps Dolby Vision, and a source
+  with its own HDR10+ keeps it. The mapping and its sources (dovi_tool, libplacebo, hdr10plus_tool) are in
+  [formats.md](docs/formats.md#dolby-vision-to-hdr10). `aetherctl` takes it as `--dv-hdr10plus`.
+
 ### Fixed
 
 - **The surround-downmix warning no longer fires on 5.1 inside a Dolby MAT carrier.** After an APAC

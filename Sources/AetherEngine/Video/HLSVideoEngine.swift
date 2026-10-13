@@ -42,7 +42,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     let sourceURL: URL
     let sourceHTTPHeaders: [String: String]
-    private let dvModeAvailable: Bool
+    let dvModeAvailable: Bool
 
     /// From `LoadOptions.keepDvh1TagWithoutDV`; default OFF, set only for misreporting DV panels.
     private let keepDvh1TagWithoutDV: Bool
@@ -1661,6 +1661,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             codecTagOverride: codecTagOverride,
             doviConfig: doviConfig,
             convertP7ToProfile81: convertP7ToProfile81,
+            synthesizeHDR10PlusFromRPU: route.synthesizesHDR10Plus,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride,
             nalFramingOverride: measuredVideoNALFraming,

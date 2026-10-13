@@ -4422,7 +4422,18 @@ public final class AetherEngine: ObservableObject {
                     dvBlCompatID: detectedDVBLCompatIDNum,
                     colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                     colorMatrix: stream.pointee.codecpar.pointee.color_space)
-                presentsDolbyVisionBaseLayer = options.dolbyVisionHandling == .baseLayerOnly
+                // `.hdr10PlusOnNonDVDisplay` routes as `.baseLayerOnly` where it synthesizes HDR10+ and as
+                // `.automatic` elsewhere; the session's display table answers the Dolby Vision half, the
+                // same table `HLSVideoEngine` routes on (`dvModeAvailable`).
+                let routedDVHandling = VideoRoutingPolicy.routedDolbyVisionHandling(
+                    requested: options.dolbyVisionHandling,
+                    displayPresentsDolbyVision: sessionDisplayCaps.supportsDolbyVision,
+                    codecID: detectedCodecID,
+                    dvProfile: detectedDVProfileNum,
+                    dvBlCompatID: detectedDVBLCompatIDNum,
+                    colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+                    colorMatrix: stream.pointee.codecpar.pointee.color_space)
+                presentsDolbyVisionBaseLayer = routedDVHandling == .baseLayerOnly
                     && detectedDVBaseLayerPresentable
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
@@ -4449,6 +4460,22 @@ public final class AetherEngine: ObservableObject {
                               + (detectedDVRPUProfile.map { "reads profile \($0)" } ?? "could not be read")
                               + "; the record stands"),
                         category: .engine)
+                }
+                if options.dolbyVisionHandling == .hdr10PlusOnNonDVDisplay, detectedFormat == .dolbyVision {
+                    let profile = detectedDVProfileNum ?? 0
+                    let compat = detectedDVBLCompatIDNum ?? 0
+                    let reason: String
+                    if presentsDolbyVisionBaseLayer {
+                        reason = "DV Profile \(profile) on a display without Dolby Vision presents its HDR10 base "
+                            + "layer with HDR10+ synthesized from the RPU"
+                    } else if sessionDisplayCaps.supportsDolbyVision {
+                        reason = "routes as automatic, the display presents Dolby Vision"
+                    } else {
+                        reason = "routes as automatic, DV Profile \(profile) compat=\(compat) has no HEVC PQ "
+                            + "base layer to carry HDR10+"
+                    }
+                    EngineLog.emit(
+                        "[AetherEngine] dolbyVisionHandling=hdr10PlusOnNonDVDisplay: \(reason)", category: .engine)
                 }
                 if options.dolbyVisionHandling == .baseLayerOnly, detectedFormat == .dolbyVision {
                     EngineLog.emit(

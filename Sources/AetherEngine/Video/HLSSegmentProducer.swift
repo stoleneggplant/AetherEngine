@@ -42,6 +42,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// Per-packet RPU conversion P7 -> 8.1 (HEVC P7 on DV panel). The container dvcC is a separate
         /// decision (`doviConfig`); this one rewrites the bitstream.
         let convertP7ToProfile81: Bool
+        /// Per-packet HDR10+ SEI synthesized from the RPU (`DolbyVisionHDR10PlusSynthesizer`). Only on the
+        /// base-layer route of `DolbyVisionHandling.hdr10PlusOnNonDVDisplay`; rewrites the bitstream.
+        let synthesizeHDR10PlusFromRPU: Bool
         /// Optional color-signaling override forwarded to `MP4SegmentMuxer.ColorOverride`.
         let colorOverride: MP4SegmentMuxer.ColorOverride?
         /// Optional replacement for `codecpar.extradata` before write_header.
@@ -63,6 +66,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecTagOverride: String?,
             doviConfig: MP4SegmentMuxer.DoviConfigPolicy = .keep,
             convertP7ToProfile81: Bool = false,
+            synthesizeHDR10PlusFromRPU: Bool = false,
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
             nalFramingOverride: VideoNALFraming? = nil,
@@ -74,6 +78,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.codecTagOverride = codecTagOverride
             self.doviConfig = doviConfig
             self.convertP7ToProfile81 = convertP7ToProfile81
+            self.synthesizeHDR10PlusFromRPU = synthesizeHDR10PlusFromRPU
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
             self.nalFramingOverride = nalFramingOverride
@@ -498,6 +503,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedEnhancementLayerType = false
     /// Latched false at SSAI program switch (ad creatives are H.264; mirrors muxer's isReinit ? false : videoConfig.convertP7ToProfile81).
     private var convertP7Active: Bool = false
+    /// Present while this producer synthesizes HDR10+ from the RPU; dropped at an SSAI program switch the
+    /// way `convertP7Active` is (an ad creative is not the Dolby Vision source).
+    private var hdr10PlusSynthesizer: DolbyVisionHDR10PlusSynthesizer?
+    private var loggedHDR10PlusSynthesisOutcome = false
     private var loggedFirstDtsBump = false
     private var loggedFirstDtsDrop = false
     private var loggedFirstAudioDtsBump = false
@@ -1537,6 +1546,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecIsH264: a53CodecKind == .h264,
             framingIsAnnexB: a53NALFraming == .annexB)
         self.convertP7Active = video.convertP7ToProfile81
+        self.hdr10PlusSynthesizer = video.synthesizeHDR10PlusFromRPU ? DolbyVisionHDR10PlusSynthesizer() : nil
         self.audioConfig = audio
         self.cache = cache
         self.baseIndex = baseIndex
@@ -3368,6 +3378,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     pendingAdVideoConfig = adConfig
                     activeMuxerVideoExtradata = adConfig.extradata  // #133 follow-up: rebaseline for same-PID PS-change detection
                     convertP7Active = false  // ad creatives are H.264
+                    hdr10PlusSynthesizer = nil
                     if lastLiveSegmentFinalizeAt != nil { stampLiveSegmentFinalize() }
                     // pendingDiscontinuityFlag / pendingForceCutFlag set by the rebase below.
                 }
@@ -4253,6 +4264,36 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     + "degrading affected frames to the HDR10 base",
                                     category: .session
                                 )
+                            }
+                        }
+                    }
+                    if let synthesizer = hdr10PlusSynthesizer {
+                        // Ahead of the cutter and the muxer, so the SEI is in the sample the segment
+                        // carries and the HDR10+ scan in `finalizeAndWriteVideo` confirms it like any other.
+                        let outcome = synthesizer.process(packet, framing: a53NALFraming)
+                        if !loggedHDR10PlusSynthesisOutcome, outcome != .noMetadata {
+                            loggedHDR10PlusSynthesisOutcome = true
+                            switch outcome {
+                            case .injected:
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] HDR10+ synthesized from the DV RPU: ST 2094-40 "
+                                    + "prefix SEI in front of each picture, peak and average from L1",
+                                    category: .session
+                                )
+                            case .sourceCarriesHDR10Plus:
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] source carries its own HDR10+; serving it, "
+                                    + "nothing synthesized from the RPU",
+                                    category: .session
+                                )
+                            case .unsupportedFraming:
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] HDR10+ synthesis skipped: the video packets use a "
+                                    + "length prefix other than 4 bytes; serving the HDR10 base layer alone",
+                                    category: .session
+                                )
+                            case .noMetadata:
+                                break
                             }
                         }
                     }

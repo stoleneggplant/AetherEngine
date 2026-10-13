@@ -400,6 +400,20 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     /// A Profile 5 or AV1 Profile 10.0 whose VUI says nothing carries IPT-PQ-c2 and has no base layer to
     /// present, so it keeps its Dolby Vision route and the engine says so in the log.
     case baseLayerOnly
+    /// Dolby Vision on a display that presents it; on one that does not, the HDR10 base layer with
+    /// HDR10+ (SMPTE ST 2094-40) dynamic metadata derived per shot from the RPU, for an HDR10+ TV that
+    /// would otherwise get one static HDR10 grade for the whole title. Routed like `.baseLayerOnly`
+    /// (`hvc1`, `dvcC` stripped, HDR10 display criteria) with one Profile A HDR10+ SEI spliced in front of
+    /// each picture; the RPU's L1 brightness (with CM v4.0 L3 applied) supplies the peak and average the
+    /// TV tone-maps from (`DolbyVisionHDR10PlusMapping` documents the mapping and where it comes from).
+    /// A source that already carries HDR10+ keeps its own and nothing is synthesized.
+    ///
+    /// Only for an HEVC source with a PQ base layer: Profile 7, Profile 8.1, and a Profile 5 record over a
+    /// BT.2020 YCbCr PQ VUI (the mislabelled remux `.baseLayerOnly` documents). HDR10+ is a PQ format, so
+    /// Profile 8.4 (HLG) and 8.2 (SDR) keep `.automatic`; so does a genuine Profile 5, whose IPT-PQ-c2 has
+    /// no base layer to carry the metadata, and AV1 Profile 10, whose RPU and HDR10+ would both ride in
+    /// metadata OBUs this rewrite does not author. Ignored on a display that presents Dolby Vision.
+    case hdr10PlusOnNonDVDisplay
 }
 
 public struct LoadOptions: Sendable, Equatable {
