@@ -68,6 +68,40 @@ struct H264CompositionOffsetRepairTests {
         #expect(verdict(samples) == .inconclusive("decode ladder is not uniform"))
     }
 
+    @Test("a hierarchical anchor proves forward distance separately from backward reorder depth")
+    func partialForwardPrefix() {
+        let ranks = [0, 4, 2, 1, 3, 8, 6, 5, 7, 12, 10, 9]
+        let dts = (0..<12).map { Int64($0) * 3600 }
+        #expect(H264PartialCompositionRepair.provenForwardDepth(
+            dts: dts, ranks: ranks, lead: 7200, reorderDepth: 2) == 3)
+        #expect(H264PartialCompositionRepair.provenForwardDepth(
+            dts: dts, ranks: ranks, lead: 3600, reorderDepth: 2) == nil)
+        #expect(H264PartialCompositionRepair.provenForwardDepth(
+            dts: dts, ranks: ranks, lead: 7200, reorderDepth: 1) == nil)
+        #expect(H264PartialCompositionRepair.provenForwardDepth(
+            dts: dts, ranks: [0, 5, 3, 2, 4, 9, 7, 6, 8, 13, 11, 10],
+            lead: 7200, reorderDepth: 2) == nil)
+    }
+
+    @Test("a variable-cadence missing head requires an exactly corroborated container lead")
+    func variableCadenceHeadProof() {
+        let dts: [Int64] = [-96000, -48000, 0, 48000, 96000, 144000,
+                            192000, 240000, 288000, 328040, 368080, 408120]
+        let pocs: [Int64] = [0, 6, 2, 4, 12, 8, 10, 18, 14, 16, 24, 20]
+        let keys = [true] + Array(repeating: false, count: 11)
+        #expect(H264PartialCompositionRepair.missingHeadForwardDepth(
+            dts: dts, pts: dts, pocs: pocs, keys: keys,
+            streamStart: 0, ladderStart: -96000, reorderDepth: 2) == 2)
+        #expect(H264PartialCompositionRepair.missingHeadForwardDepth(
+            dts: dts, pts: dts, pocs: pocs, keys: keys,
+            streamStart: 1, ladderStart: -96000, reorderDepth: 2) == nil)
+        var healthy = dts
+        healthy[0] = 0
+        #expect(H264PartialCompositionRepair.missingHeadForwardDepth(
+            dts: dts, pts: healthy, pocs: pocs, keys: keys,
+            streamStart: 0, ladderStart: -96000, reorderDepth: 2) == nil)
+    }
+
     @Test("a sample that does not start on a picture-order origin cannot be anchored")
     func mustStartOnOrigin() {
         var samples = malformedSamples()

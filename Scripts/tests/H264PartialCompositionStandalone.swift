@@ -32,7 +32,73 @@ struct H264PartialCompositionTests {
         return (times, deepest, !queue.isEmpty)
     }
 
+    static func missingHeadChecks() {
+        let ticks: [Int64] = [-48000, 0, 48000, 96000, 144000, 192000, 240000, 288000, 336000, 384000, 424040, 464080]
+        let order: [Int64] = [0, 6, 2, 4, 12, 8, 10, 18, 14, 16, 22, 20]
+        let keys = [true] + Array(repeating: false, count: 11)
+        func proof(_ dts: [Int64] = ticks, pts: [Int64]? = nil, pocs: [Int64] = order,
+                   start: Int64 = 0, origin: Int64 = -48000, depth: Int = 1) -> Int? {
+            Policy.missingHeadForwardDepth(dts: dts, pts: pts ?? dts, pocs: pocs, keys: keys,
+                streamStart: start, ladderStart: origin, reorderDepth: depth)
+        }
+        precondition(proof() == 2) // Forward-coded P differs from backward reorder lead.
+        precondition(proof(start: -48000) == nil)
+        precondition(proof(start: 1) == nil)
+        precondition(proof(origin: 0) == nil)
+        precondition(proof(depth: 0) == nil)
+        precondition(proof(depth: 17) == nil)
+        precondition(proof(pocs: Array(stride(from: Int64(0), to: 24, by: 2))) == nil)
+        for bad: Int64 in [-1, 3, 6, 1000, Int64.max] {
+            var changed = order; changed[4] = bad
+            precondition(proof(pocs: changed) == nil)
+        }
+        var offset = ticks; offset[3] += 1
+        precondition(proof(pts: offset) == nil)
+        var flat = ticks; flat[3] = flat[2]
+        precondition(proof(flat) == nil)
+        var missing = ticks; missing[3] = Int64.min
+        precondition(proof(missing) == nil)
+        precondition(proof(Array(ticks.prefix(11))) == nil)
+        print("PASS missing head: corroborated lead, variable slots, bounded forward reorder; invalid/ambiguous evidence refused")
+    }
+
+    static func forwardProofChecks() {
+        let ranks = [0, 4, 2, 1, 3, 8, 6, 5, 7, 12, 10, 9]
+        let dts = (0..<12).map { Int64($0) * 3600 }
+        func proof(_ order: [Int] = ranks, slots: [Int64] = dts, lead: Int64 = 7200,
+                   depth: Int = 2) -> Int? {
+            Policy.provenForwardDepth(dts: slots, ranks: order, lead: lead, reorderDepth: depth)
+        }
+        precondition(proof() == 3)
+        precondition(proof(slots: dts.map { $0 + 63_000_000 }) == 3)
+        precondition(proof(lead: 3600) == nil)
+        precondition(proof(depth: 1) == nil)
+        precondition(proof(Array(ranks.prefix(11)), slots: Array(dts.prefix(11))) == nil)
+        precondition(proof(Array(0..<12)) == nil)
+        for bad in [-1, 0, 1000, Int.max] {
+            var order = ranks; order[4] = bad
+            precondition(proof(order) == nil)
+        }
+        // Unique bounded ranks can still omit a display slot: no complete prefix, no proof.
+        precondition(proof([0, 5, 3, 2, 4, 9, 7, 6, 8, 13, 11, 10]) == nil)
+        var repeated = dts; repeated[4] = repeated[3]
+        precondition(proof(slots: repeated) == nil)
+        var missing = dts; missing[4] = Int64.min
+        precondition(proof(slots: missing) == nil)
+        precondition(proof(slots: dts.map { Int64.max - 40000 + $0 }) == nil)
+        var ladder = Policy.SlotLadder()
+        for value in dts { precondition(ladder.append(dts: value)) }
+        precondition(ladder.claim(rank: 4, decodeIndex: 1, lead: 7200, reorderDepth: 2) == .refuse)
+        precondition(ladder.refusalReason == "forward_wait_depth_exceeded")
+        precondition(ladder.claim(rank: 4, decodeIndex: 1, lead: 7200, reorderDepth: 2, forwardDepth: 3) == .time(21600))
+        precondition(ladder.claim(rank: 4, decodeIndex: 1, lead: 7200, reorderDepth: 2, forwardDepth: 3) == .refuse)
+        precondition(ladder.refusalReason == "duplicate_display_rank")
+        print("PASS partial forward proof: complete prefix, asymmetric depth, exact slot, invalid evidence refused")
+    }
+
     static func main() {
+        missingHeadChecks()
+        forwardProofChecks()
         let expected = pocs.map { slots[Int($0 / 2)] + lead }
         let plain = run()
         precondition(!plain.refused)

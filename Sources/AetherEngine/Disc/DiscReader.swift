@@ -276,7 +276,12 @@ enum DiscReader {
         // A disc folder is a set of files, not one byte range, so it is recognized before the cache,
         // which rebuilds a reader from extents of a single image.
         if let folder = reader as? DiscDirectoryReader {
-            return wrapBluRayFolder(folder, selectTitleID: selectTitleID)
+            // Blu-ray first and DVD-Video as the fallback, as on an image, so a hybrid listing with both
+            // trees plays its Blu-ray title.
+            func has(_ root: String) -> Bool { folder.discFiles.contains { $0.path.uppercased().hasPrefix(root) } }
+            guard has("VIDEO_TS/") else { return wrapBluRayFolder(folder, selectTitleID: selectTitleID) }
+            if has("BDMV/"), let bluRay = wrapBluRayFolder(folder, selectTitleID: selectTitleID) { return bluRay }
+            return wrapDVDFolder(folder, selectTitleID: selectTitleID)
         }
         if let cacheKey, let cached = DiscRecognitionCache.lookup(key: cacheKey, selectTitleID: selectTitleID) {
             return DiscInfo(reader: ConcatIOReader(base: reader, extents: cached.extents),
@@ -343,6 +348,26 @@ enum DiscReader {
     /// listing holds no title VOBs.
     private static func wrapDVD(_ reader: IOReader, files: [DiscFile], sectorSize: Int, selectTitleID: Int?,
                                 cacheKey: String?) -> DiscInfo? {
+        let readFile: (DiscFile) -> [UInt8] = { file in
+            readAll(reader, [(offset: Int64(file.startSector * sectorSize), length: Int64(file.length))])
+        }
+        guard let set = dvdTitleSet(files: files, selectTitleID: selectTitleID, readFile: readFile) else { return nil }
+        let extents = set.vobs.map {
+            (offset: Int64($0.startSector * sectorSize), length: Int64($0.length))
+        }
+        let (cellTimeline, timeMap) = set.selectedIFO.map(dvdCellTimeline) ?? ([], nil)
+        storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
+                         formatHint: "mpeg", titles: set.titles, selectedIndex: set.selectedIndex, extents: extents,
+                         clipTimeline: cellTimeline, dvdTimeMap: timeMap)
+        return DiscInfo(reader: ConcatIOReader(base: reader, extents: extents),
+                        formatHint: "mpeg", titles: set.titles, selectedTitleIndex: set.selectedIndex,
+                        clipTimeline: cellTimeline, dvdTimeMap: timeMap)
+    }
+
+    /// The titles of a `VIDEO_TS` listing and the selected one's VOBs (in part order) and VTS IFO, whatever
+    /// holds the bytes: `readFile` reads one whole file. nil when the listing holds no title VOBs.
+    static func dvdTitleSet(files: [DiscFile], selectTitleID: Int?, readFile: (DiscFile) -> [UInt8])
+        -> (titles: [DiscTitle], selectedIndex: Int, vobs: [DiscFile], selectedIFO: [UInt8]?)? {
         let groups = DVDTitleSelector.enumerateTitleVOBGroups(files)
         guard !groups.isEmpty else { return nil }
         // VIDEO_TS.IFO's TT_SRPT names which title sets are real titles; filter the VOB groups to those so
@@ -350,19 +375,12 @@ enum DiscReader {
         // falls back to the full VOB-grouped set, so a disc with an unreadable VMGI still plays multi-title.
         var orderedGroups = groups
         let filesByName = Dictionary(files.map { ($0.name.uppercased(), $0) }, uniquingKeysWith: { first, _ in first })
-        if let ifoFile = filesByName["VIDEO_TS.IFO"] {
-            let ifoBytes = readAll(reader, [(offset: Int64(ifoFile.startSector * sectorSize),
-                                             length: Int64(ifoFile.length))])
-            if let ifoTitles = DVDIFOParser.parseTitles(ifoBytes) {
-                let titleVTSNs = Set(ifoTitles.map(\.vtsn))
-                let filtered = groups.filter { titleVTSNs.contains($0.vtsn) }
-                if !filtered.isEmpty { orderedGroups = filtered }
-            }
+        if let ifoFile = filesByName["VIDEO_TS.IFO"], let ifoTitles = DVDIFOParser.parseTitles(readFile(ifoFile)) {
+            let titleVTSNs = Set(ifoTitles.map(\.vtsn))
+            let filtered = groups.filter { titleVTSNs.contains($0.vtsn) }
+            if !filtered.isEmpty { orderedGroups = filtered }
         }
         let selectedIndex = selectTitleID.flatMap { orderedGroups.indices.contains($0) ? $0 : nil } ?? 0
-        let extents = orderedGroups[selectedIndex].vobs.map {
-            (offset: Int64($0.startSector * sectorSize), length: Int64($0.length))
-        }
         // Whole-VTS titles. Each VTS_NN_0.IFO's main PGC gives the title duration and chapter starts; a disc
         // with an unreadable VTS IFO keeps duration 0 / no chapters but still plays. dvdVTSN keeps the
         // title -> title-set mapping.
@@ -376,8 +394,7 @@ enum DiscReader {
             let nn = g.vtsn < 10 ? "0\(g.vtsn)" : "\(g.vtsn)"
             let ifoName = "VTS_\(nn)_0.IFO"
             if let vtsIFO = filesByName[ifoName] {
-                let bytes = readAll(reader, [(offset: Int64(vtsIFO.startSector * sectorSize),
-                                             length: Int64(vtsIFO.length))])
+                let bytes = readFile(vtsIFO)
                 if idx == selectedIndex { selectedIFO = bytes }
                 if let detail = DVDIFOParser.parseTitleDetail(bytes) {
                     durationTicks = detail.durationTicks
@@ -392,13 +409,7 @@ enum DiscReader {
                              streamLanguages: streamLanguages,
                              dvdSubpictureStreamIDs: subpictureStreamIDs)
         }
-        let (cellTimeline, timeMap) = selectedIFO.map(dvdCellTimeline) ?? ([], nil)
-        storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
-                         formatHint: "mpeg", titles: titles, selectedIndex: selectedIndex, extents: extents,
-                         clipTimeline: cellTimeline, dvdTimeMap: timeMap)
-        return DiscInfo(reader: ConcatIOReader(base: reader, extents: extents),
-                        formatHint: "mpeg", titles: titles, selectedTitleIndex: selectedIndex,
-                        clipTimeline: cellTimeline, dvdTimeMap: timeMap)
+        return (titles, selectedIndex, orderedGroups[selectedIndex].vobs, selectedIFO)
     }
 
     /// The selected DVD title's cells as AE#105 clip spans, and its time map.

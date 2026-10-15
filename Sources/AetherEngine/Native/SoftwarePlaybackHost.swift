@@ -111,6 +111,12 @@ final class SoftwarePlaybackHost {
     /// point it uses for `AVPlayerLayer`.
     var displayLayer: AVSampleBufferDisplayLayer { renderer.displayLayer }
 
+    /// Whether load selected VideoToolbox rather than libavcodec / dav1d for video decoding.
+    /// Only meaningful after load has returned successfully.
+    var usesHardwareVideoDecoder: Bool {
+        videoDecoder is HardwareVideoDecoder || videoDecoder is DolbyVisionFELDecoder
+    }
+
     /// AE#711 follow-up: the picture on screen now, read back from the renderer before a rebuild's
     /// `stop()` flushes it, so the engine can hold it over the new host's startup. Falls back to the
     /// newest frame enqueued, which a layer that is not on screen is all there is of.

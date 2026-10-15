@@ -32,9 +32,45 @@ the public-API contract.
   decoder that cannot open falls back to the single-layer VideoToolbox decoder instead of failing the
   load. The software host keeps its usual costs (picture on the device only, no Atmos passthrough),
   which is why the route is opt-in.
+- **A DVD-Video ripped as a `VIDEO_TS` folder plays over HTTP, as a `BDMV` folder does.** A
+  `DiscDirectoryReader` (or `HTTPDiscDirectoryReader`) whose listing holds `VIDEO_TS/` files is now read
+  as DVD-Video: the title sets, VMGI filtering, durations, chapters and languages come from the same code
+  as an image's (`DiscReader.dvdTitleSet`, now shared), the selected title's VOBs play back to back in
+  part order, and the cell timeline and VTS time map apply as on an image, since the VOBs in order are
+  the same run of bytes as their sectors. A listing without `VIDEO_TS/` is read as Blu-ray, as before,
+  and one with both trees plays its Blu-ray title, the order an image is recognized in.
 
 ### Fixed
 
+- **`serveIFramePlaylist` shows scrub thumbnails for HDR10, HLG and Dolby Vision titles** (#682). The
+  stock tvOS scrubber fetched the first keyframe of a PQ rendition and then left the thumbnail box empty,
+  for Dolby Vision profile 5 and 8.1 as much as for plain HDR10, at 4K and at 1080p (measured on an Apple
+  TV 4K, tvOS 27). An HDR or Dolby Vision session now lists a Motion JPEG rendition instead
+  (`CODECS="mjpg"`, `VIDEO-RANGE=SDR`, 640 pixels wide), whose stills come from the engine's own still
+  pipeline: the tone map for PQ and HLG, the RPU reshaping for profile 5. SDR sessions keep serving their
+  own keyframes. The session log names the format: `i-frame rendition: served segments=<n>
+  format=keyframes|jpeg`. Because an SDR rendition is the one thing AVPlayer can still play when it
+  refuses the HDR variant (an SDR panel without dynamic range matching), `iframe.m3u8` is answered only
+  once a media segment has been requested; otherwise it is withheld after 3 s, and the item's 404 counts
+  as the refusal it stands for, so the session still falls back to the media playlist instead of
+  playing the stills as its video.
+
+- **A 25 fps H.264 Matroska file with forward-clamped B-picture timestamps plays at a steady
+  cadence.** Its packet timestamps repeated display slots and left the preceding slots empty, so
+  decoded output alternated 0 ms and 80 ms frame intervals instead of 40 ms. The demuxer now
+  recognizes that shape only from an exact CFR lattice, complete picture-order ranks and two
+  corroborating clamps, then reconstructs PTS and DTS from the IDR anchor, picture order and decode
+  order. A seek starts from a new IDR, and overflow or any later timestamp outside the proven shape
+  disables the repair and leaves that packet untouched, as does a reconstruction that would present a
+  picture before its decode time.
+- **H.264 MP4s with missing composition offsets keep display order across cadence changes and
+  hierarchical B pictures.** A corroborated missing-offset head with a changing decode cadence now
+  reuses the existing timestamp slots. Later zero-offset regions can prove a forward-coded anchor
+  farther ahead than the declared backward reorder delay, using a bounded complete-prefix check.
+  Original DTS, audio, payload and index remain unchanged; unsupported sequences still pass through.
+- **`activeVideoDecoder` names the decoder used by the software host (#753).** HEVC decoded by
+  VideoToolbox now reports `VideoToolbox HEVC (HW)` on initial load and reload, instead of
+  `libavcodec HEVC (SW)`. Decoder selection and playback routing are unchanged.
 - **A live GOP longer than the sealed target duration no longer breaks the playlist.** RFC 8216 keeps
   `TARGETDURATION` fixed for a playlist's life, so a later segment above it made the playlist invalid
   for AVPlayer (-12642). The engine now retires that playlist URL with its original target and an

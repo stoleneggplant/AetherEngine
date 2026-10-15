@@ -250,6 +250,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// that took it, at once when the rendition stays absent, or in `stop()`.
     var customIFrameReader: (reader: IOReader, formatHint: String?)?
     private(set) var iFrameRenditionVerdict: IFrameRenditionEligibility.Verdict = .absent(.notRequested)
+    /// AE#682: the server withheld the JPEG I-frame playlist because AVPlayer never asked for a media
+    /// segment, which is how a refused HDR variant looks next to an SDR I-frame rendition.
+    var iFrameRenditionWithheld: Bool { server?.iFrameRenditionWithheld ?? false }
     private var iFrameRendition: IFrameRendition?
 
     /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
@@ -2208,11 +2211,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.servingMasterPlaylist = useMasterPlaylist
         iFrameRenditionVerdict = IFrameRenditionEligibility.resolve(
             candidate: iFrameCandidate, servingMaster: useMasterPlaylist)
-        if iFrameRenditionVerdict == .served, let rendition = makeIFrameRendition(plan: plan, cache: segmentCache) {
+        if iFrameRenditionVerdict == .served,
+           let rendition = makeIFrameRendition(plan: plan, cache: segmentCache,
+                                               sourceIsHDR: videoRange != .sdr || dvVariant != .none) {
             iFrameRendition = rendition
             prov.setIFrameSource(rendition)
-            EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count)",
-                           category: .session)
+            EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count) "
+                           + "format=\(rendition.format.logName)", category: .session)
         } else if iFramePlaylistRequested {
             closeUnusedCustomIFrameReader()
             if iFrameRenditionVerdict == .served { iFrameRenditionVerdict = .absent(.noSecondReader) }
@@ -2741,7 +2746,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     // MARK: - I-frame rendition (AE#682)
 
-    private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache) -> IFrameRendition? {
+    /// `sourceIsHDR` picks the format: AVKit shows no scrub thumbnail from a PQ or Dolby Vision
+    /// keyframe, so those sessions serve tone-mapped JPEG stills instead of the keyframes themselves.
+    private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache,
+                                     sourceIsHDR: Bool) -> IFrameRendition? {
         guard let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
         let directory = segmentCache.sessionDir.appendingPathComponent("iframes", isDirectory: true)
         let staging = directory.appendingPathComponent("staging", isDirectory: true)
@@ -2752,7 +2760,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                            category: .session)
             return nil
         }
-        let builder = IFrameFragmentBuilder(
+        let keyframeBuilder = IFrameFragmentBuilder(
             video: MP4SegmentMuxer.VideoConfig(
                 codecpar: cfg.codecpar, timeBase: cfg.timeBase,
                 codecTagOverride: cfg.codecTagOverride, doviConfig: cfg.doviConfig,
@@ -2760,6 +2768,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 convertsAnnexBSamples: cfg.convertsAnnexBSamples,
                 nalFramingLatch: cfg.nalFramingLatch),
             stagingDir: staging)
+        let format: IFrameRenditionFormat
+        let buildFragment: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?
+        let par = cfg.codecpar.pointee
+        if sourceIsHDR, let size = IFrameJPEGBuilder.size(
+            codedWidth: Int(par.width), codedHeight: Int(par.height),
+            sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den) {
+            let jpeg = IFrameJPEGBuilder(keyframe: keyframeBuilder, width: size.width, height: size.height)
+            let shortest = plan.map(\.durationSeconds).filter { $0 > 0 }.min() ?? 1
+            format = .jpeg(width: size.width, height: size.height,
+                           bandwidth: IFrameJPEGBuilder.bandwidth(shortestSegmentSeconds: shortest))
+            buildFragment = { payload, index, entry in
+                jpeg.build(payload: payload, index: index,
+                           startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
+            }
+        } else {
+            format = .keyframes
+            buildFragment = { payload, index, entry in
+                keyframeBuilder.build(payload: payload, index: index,
+                                      startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
+            }
+        }
         let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
             codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
@@ -2786,11 +2815,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return IFrameRendition(
             entries: entries,
             cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
+            format: format,
             readPayload: { reader.payload(startPts: $0.startPts) },
-            buildFragment: { payload, index, entry in
-                builder.build(payload: payload, index: index,
-                              startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
-            },
+            buildFragment: buildFragment,
             waitForLink: { [weak self] shouldStop in
                 // A seek or a producer restart owns the link for a moment; a thumbnail can wait that
                 // out, but not ordinary fetching, or it would stall whenever the pump is busy.

@@ -64,7 +64,15 @@ enum MasterFallbackDecision {
 
     /// A malformed media playlist can be wrapped in the same -11848 as a display refusal.
     /// It says nothing about HDR support and must not poison the process's display decision.
-    static func isMasterRejection(_ error: NSError, mediaErrorCodes: [Int] = []) -> Bool {
+    ///
+    /// AE#682: an HDR master with an SDR motion JPEG I-frame rendition has one variant left when AVPlayer
+    /// refuses the HDR one, and AVPlayer would play the stills as the video. The server therefore
+    /// withholds the I-frame playlist until a media segment is asked for, and the refused item fails
+    /// with the 404's NSURLErrorDomain -1100. With `iFramePlaylistWithheld` that is the -11848 refusal
+    /// it stands in for.
+    static func isMasterRejection(_ error: NSError, mediaErrorCodes: [Int] = [],
+                                  iFramePlaylistWithheld: Bool = false) -> Bool {
+        if iFramePlaylistWithheld, isWithheldIFramePlaylistFailure(error) { return true }
         guard !mediaErrorCodes.contains(-12642) else { return false }
         var current: NSError? = error
         for _ in 0..<8 {
@@ -73,6 +81,16 @@ enum MasterFallbackDecision {
             current = value.userInfo[NSUnderlyingErrorKey] as? NSError
         }
         return isMasterRejectionCode(error.code)
+    }
+
+    static func isWithheldIFramePlaylistFailure(_ error: NSError) -> Bool {
+        error.domain == NSURLErrorDomain && error.code == NSURLErrorFileDoesNotExist
+    }
+
+    /// The code the fallback acts on: the item's own, or for a withheld I-frame playlist the display
+    /// refusal the 404 stands in for.
+    static func rejectionCode(for error: NSError, iFramePlaylistWithheld: Bool) -> Int {
+        iFramePlaylistWithheld && isWithheldIFramePlaylistFailure(error) ? -11848 : error.code
     }
 
     /// Fall back to the media playlist only when a master-rejection failed the item, the engine was

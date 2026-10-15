@@ -7,8 +7,11 @@ private final class IFrameMockProvider: HLSSegmentProvider, @unchecked Sendable 
     let served: Bool
     let durations: [Double]
     let supplemental: String?
-    init(served: Bool, durations: [Double] = [4.0, 4.0, 2.5], supplemental: String? = nil) {
+    let format: IFrameRenditionFormat?
+    init(served: Bool, durations: [Double] = [4.0, 4.0, 2.5], supplemental: String? = nil,
+         format: IFrameRenditionFormat? = nil) {
         self.served = served; self.durations = durations; self.supplemental = supplemental
+        self.format = format
     }
     func initSegment() -> Data? { Data([0x00]) }
     func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
@@ -22,6 +25,7 @@ private final class IFrameMockProvider: HLSSegmentProvider, @unchecked Sendable 
     var masterBandwidth: Int? { 12_000_000 }
     var masterFrameRate: Double? { 23.976 }
     var iFrameRenditionServed: Bool { served }
+    var iFrameRenditionFormat: IFrameRenditionFormat? { format }
 }
 
 struct IFramePlaylistTextTests {
@@ -35,6 +39,17 @@ struct IFramePlaylistTextTests {
                 + "RESOLUTION=3840x2160,VIDEO-RANGE=PQ,URI=\"iframe.m3u8\"")
         let variantURI = try! #require(lines.firstIndex(of: "media.m3u8"))
         #expect(lines.firstIndex(of: tag[0])! > variantURI)
+    }
+
+    @Test("a JPEG rendition is declared as SDR motion JPEG, whatever the variant carries")
+    func masterLineForJPEG() {
+        let p = IFrameMockProvider(served: true, supplemental: "dvh1.08.06/db1p",
+                                   format: .jpeg(width: 640, height: 360, bandwidth: 790_000))
+        let tag = HLSLocalServer.buildMasterPlaylistText(provider: p)
+            .split(separator: "\n").map(String.init)
+            .filter { $0.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:") }
+        #expect(tag == ["#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=790000,CODECS=\"mjpg\","
+                        + "RESOLUTION=640x360,VIDEO-RANGE=SDR,URI=\"iframe.m3u8\""])
     }
 
     @Test("master is untouched when the rendition is not served")

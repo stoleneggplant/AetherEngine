@@ -54,6 +54,7 @@ struct H264PartialCompositionRuntimeTests {
     enum Failure: Error { case open, decoder, demux, decode, session, boundedRead }
     static func main() throws {
         guard CommandLine.arguments.count >= 2 else { throw Failure.open }
+        EngineLog.handler = { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
         av_log_set_level(AV_LOG_QUIET)
         var format: UnsafeMutablePointer<AVFormatContext>?
         guard avformat_open_input(&format, CommandLine.arguments[1], nil, nil) >= 0, let format else { throw Failure.open }
@@ -62,6 +63,7 @@ struct H264PartialCompositionRuntimeTests {
         let index = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
         guard index >= 0, let stream = format.pointee.streams[Int(index)],
               let par = stream.pointee.codecpar, par.pointee.codec_id == AV_CODEC_ID_H264 else { throw Failure.open }
+        let twinPTS = try ProcessInfo.processInfo.environment["AETHER_TIMESTAMP_HEALTHY_TWIN"].map(referenceTimes)
         let name = format.pointee.iformat.flatMap { $0.pointee.name }.map(String.init(cString:)) ?? ""
         let matroska = name.contains("matroska")
         guard !matroska else { throw Failure.session }
@@ -85,6 +87,7 @@ struct H264PartialCompositionRuntimeTests {
             avcodec_flush_buffers(raw); avcodec_flush_buffers(fixed)
             var rawPTS: [Int64] = [], fixedPTS: [Int64] = []
             var videoRead = 0, reads = 0, delivered = 0, stop = false, observedRepair = false
+            var lastOther: [Int32: Int64] = [:]
             func emit(_ packet: UnsafeMutablePointer<AVPacket>) throws {
                 defer { var owned: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&owned) }
                 let expected = inputs.removeValue(forKey: UInt(bitPattern: packet))!
@@ -96,8 +99,18 @@ struct H264PartialCompositionRuntimeTests {
                     precondition(actual.duration == expected.duration && actual.flags == expected.flags)
                     precondition(actual.position == expected.position && actual.streamIndex == expected.streamIndex)
                     precondition(actual.dts == expected.dts, "partial repair must preserve the published decode/index axis")
+                    if let twinPTS {
+                        precondition(twinPTS[actual.dts] == actual.pts, "repaired video PTS must exactly match its healthy twin")
+                    }
                     try decode(fixed, packet: packet, into: &fixedPTS)
-                } else { precondition(actual == expected) }
+                } else {
+                    precondition(actual == expected)
+                    // Other streams keep the container's order: a held packet must not overtake one
+                    // that was handed over before it.
+                    precondition(lastOther[actual.streamIndex].map { actual.dts > $0 } ?? true,
+                                 "non-video packet left the session out of order")
+                    lastOther[actual.streamIndex] = actual.dts
+                }
                 delivered += 1
             }
             while !stop {
@@ -120,7 +133,8 @@ struct H264PartialCompositionRuntimeTests {
                     try decode(raw, packet: packet, into: &rawPTS)
                 }
                 if !session.ingest(packet) { try emit(packet) }
-                observedRepair = observedRepair || session.summary.contains("confirmed_partial_composition_offsets")
+                observedRepair = observedRepair || (session.summary.contains("confirmed_partial_composition_offsets") || session.summary.contains("confirmed_missing_composition_offsets"))
+
             }
             session.endOfStream()
             while let packet = session.dequeue() { try emit(packet) }
@@ -130,7 +144,7 @@ struct H264PartialCompositionRuntimeTests {
             let rawRegressions = zip(rawPTS, rawPTS.dropFirst()).filter { $1 <= $0 }.count
             let fixedRegressions = zip(fixedPTS, fixedPTS.dropFirst()).filter { $1 <= $0 }.count
             let diagnostic = session.summary
-            observedRepair = observedRepair || diagnostic.contains("confirmed_partial_composition_offsets")
+            observedRepair = observedRepair || (diagnostic.contains("confirmed_partial_composition_offsets") || diagnostic.contains("confirmed_missing_composition_offsets"))
             FileHandle.standardError.write(Data("MEASURE seek=\(position) raw=\(rawRegressions) fixed=\(fixedRegressions) offset=\(session.decodeTimestampOffset ?? 0) state=\(diagnostic) lead=\(0) shift=\(0)\n".utf8))
             precondition(rawPTS.count == fixedPTS.count && !fixedPTS.isEmpty)
             precondition(fixedRegressions == 0)
@@ -143,6 +157,29 @@ struct H264PartialCompositionRuntimeTests {
         if positions.count > 1 {
             try lifecycleChecks(session: session, format: format, stream: stream, index: index, position: positions[1])
         }
+    }
+
+    /// Optional generated healthy twin checks exact timestamps, beyond monotonic decoded output.
+    static func referenceTimes(_ path: String) throws -> [Int64: Int64] {
+        var input: UnsafeMutablePointer<AVFormatContext>?
+        guard avformat_open_input(&input, path, nil, nil) >= 0, let input else { throw Failure.open }
+        defer { var owned: UnsafeMutablePointer<AVFormatContext>? = input; avformat_close_input(&owned) }
+        guard avformat_find_stream_info(input, nil) >= 0 else { throw Failure.open }
+        let index = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
+        guard index >= 0 else { throw Failure.open }
+        var result: [Int64: Int64] = [:]
+        while true {
+            guard let packet = trackedPacketAlloc() else { throw Failure.demux }
+            defer { av_packet_free_safe(packet) }
+            let status = av_read_frame(input, packet)
+            if status == -541478725 { break }
+            guard status >= 0 else { throw Failure.demux }
+            if packet.pointee.stream_index == index {
+                precondition(result.count < 8000 && result[packet.pointee.dts] == nil)
+                result[packet.pointee.dts] = packet.pointee.pts
+            }
+        }
+        return result
     }
 
     static func lifecycleChecks(session: H264CompositionOffsetRepairSession,
@@ -172,7 +209,7 @@ struct H264PartialCompositionRuntimeTests {
             var confirmed = false
             for _ in 0..<4000 {
                 try read()
-                if session.summary.contains("confirmed_partial_composition_offsets") { confirmed = true; break }
+                if (session.summary.contains("confirmed_partial_composition_offsets") || session.summary.contains("confirmed_missing_composition_offsets")) { confirmed = true; break }
             }
             precondition(confirmed)
             guard let packet = trackedPacketAlloc() else { throw Failure.demux }
@@ -181,6 +218,7 @@ struct H264PartialCompositionRuntimeTests {
             packet.pointee.pts = malformed.pts
             if !session.ingest(packet) { av_packet_free_safe(packet) }
             while let packet = session.dequeue() { av_packet_free_safe(packet) }
+            precondition(session.summary.contains("partial_composition_sequence_unproven"))
             precondition(PacketBalanceTracker.alive == 0, "a refusal still owns every packet it took")
             // A refused sequence streams through the session rather than out of its queue, so
             // count both ways a packet can come back.
@@ -204,6 +242,9 @@ struct H264PartialCompositionRuntimeTests {
             guard let packet = trackedPacketAlloc() else { throw Failure.demux }
             packet.pointee.stream_index = index + 1
             if session.ingest(packet) { heldForeign += 1 } else { av_packet_free_safe(packet) }
+            // The demuxer drains the queue before every read, so a released packet is gone again
+            // before the next one arrives.
+            while let released = session.dequeue() { av_packet_free_safe(released) }
         }
         precondition(heldForeign > 0 && heldForeign <= H264PartialCompositionRepair.maximumHeldPackets,
                      "the all-stream budget has to end the hold, held \(heldForeign)")

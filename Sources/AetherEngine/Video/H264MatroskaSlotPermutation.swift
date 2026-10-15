@@ -59,8 +59,8 @@ enum H264MatroskaSlotPermutation {
     typealias Sample = H264CompositionOffsetRepair.Sample
 
     /// Video pictures to sample before deciding, and the same held-packet ceilings the ISO-BMFF
-    /// sample pays. A well-formed MKV with B-frames never reaches any of them: its first stepped-back
-    /// slot ends the sampling, and that is normally the third packet.
+    /// sample pays. Streams without an exact whole-tick cadence still exit on their first
+    /// stepped-back slot, normally the third packet.
     static let sampleTarget = H264CompositionOffsetRepair.sampleTarget
     static let minimumSamples = H264CompositionOffsetRepair.minimumSamples
     static let sampleByteBudget = H264CompositionOffsetRepair.sampleByteBudget
@@ -71,6 +71,12 @@ enum H264MatroskaSlotPermutation {
     /// wait nobody should pay.
     static let lookaheadCeiling: Int64 = 32
 
+    private static func timestamp(anchor: Int64, index: Int64, step: Int64) -> Int64? {
+        let (offset, productOverflow) = index.multipliedReportingOverflow(by: step)
+        let (value, sumOverflow) = anchor.addingReportingOverflow(offset)
+        return productOverflow || sumOverflow ? nil : value
+    }
+
     enum Verdict: Equatable, Sendable {
         /// The container presents in display order, which is what the format says it should do.
         case healthy
@@ -78,28 +84,24 @@ enum H264MatroskaSlotPermutation {
         case inconclusive(String)
         /// Ticks a picture order count advances per displayed picture, measured rather than assumed.
         case permute(pocStep: Int64)
+        /// A CFR ladder whose B-picture timestamps were clamped forward onto their decode slots.
+        case reconstruct(step: Int64, pocStep: Int64)
     }
 
     /// Fail-closed decision over the sampled head. Anything unproven returns `.inconclusive`, which
     /// leaves the stream exactly as the container delivered it.
-    static func classify(samples: [Sample], videoDelay: Int) -> Verdict {
+    static func classify(samples: [Sample], videoDelay: Int, nominalStep: Int64? = nil) -> Verdict {
         guard videoDelay > 0, videoDelay <= 16 else {
             return .inconclusive("reorder delay \(videoDelay) outside 1...16")
         }
-        // One stepped-back slot is the container doing its job, and it ends the sampling before the
-        // window fills. `PTS != DTS` proves nothing here: libavformat synthesizes a decode ladder
-        // from a rising presentation one just as readily as from a reordered one, which is why the
-        // ISO-BMFF eligibility test cannot be reused.
         let slots = samples.map(\.pts)
-        if zip(slots, slots.dropFirst()).contains(where: { $1 < $0 }) { return .healthy }
+        if nominalStep == nil,
+           zip(slots, slots.dropFirst()).contains(where: { $1 < $0 }) { return .healthy }
         guard samples.count >= minimumSamples else {
             return .inconclusive("only \(samples.count) sampled pictures")
         }
         guard slots.allSatisfy({ $0 != Int64.min }) else {
             return .inconclusive("presentation slots are not all stated")
-        }
-        guard !zip(slots, slots.dropFirst()).contains(where: { $1 == $0 }) else {
-            return .inconclusive("two pictures share a presentation slot")
         }
         guard let first = samples.first, first.isKeyframe, first.pictureOrderCount == 0 else {
             return .inconclusive("sample does not start on a picture-order origin")
@@ -141,6 +143,70 @@ enum H264MatroskaSlotPermutation {
               highest - lowest + 1 <= Int64(samples.count + videoDelay + 1) else {
             return .inconclusive("display ranks do not fill the sampled window")
         }
+
+        // Some Matroska writers preserve most CFR presentation slots but clamp a B picture whose
+        // true PTS precedes its synthesized DTS forward onto that DTS. The result has paired duplicate
+        // PTS/DTS slots and paired holes: decoded output alternates 0 and 2 frame intervals forever.
+        // Reconstruct only when the container's declared rate is an exact whole-tick cadence, every
+        // picture-order rank lands either on that lattice or on this precise forward clamp, and at
+        // least two clamps corroborate the shape. A VFR ladder, one damaged packet, and #511's
+        // coding-order-slot defect all fail closed.
+        if let step = nominalStep, step > 0 {
+            let anchor = first.pts
+            var clamped = 0
+            var reconstructable = true
+            for (decodeIndex, sample) in samples.enumerated() {
+                let rank = sample.pictureOrderCount / pocStep
+                guard let expectedPTS = timestamp(anchor: anchor, index: rank, step: step),
+                      let expectedDTS = timestamp(
+                        anchor: anchor,
+                        index: Int64(decodeIndex) - Int64(videoDelay), step: step)
+                else {
+                    reconstructable = false
+                    break
+                }
+                // A reconstruction that would present a picture before it is decoded describes some
+                // other stream, and handing it out would break the decoder instead of the cadence.
+                guard expectedPTS >= expectedDTS else {
+                    reconstructable = false
+                    break
+                }
+                if sample.pts != expectedPTS {
+                    let (forward, overflow) = sample.pts.subtractingReportingOverflow(expectedPTS)
+                    guard !overflow, sample.pts == sample.dts, forward == step,
+                          !slots.contains(expectedPTS),
+                          slots.filter({ $0 == sample.pts }).count == 2 else {
+                        reconstructable = false
+                        break
+                    }
+                    clamped += 1
+                }
+                if sample.dts == Int64.min {
+                    guard decodeIndex < videoDelay else {
+                        reconstructable = false
+                        break
+                    }
+                } else if sample.dts != expectedDTS {
+                    let (forward, overflow) = sample.dts.subtractingReportingOverflow(expectedDTS)
+                    guard !overflow, sample.pts != expectedPTS, sample.dts == sample.pts,
+                          forward == step else {
+                        reconstructable = false
+                        break
+                    }
+                }
+            }
+            if reconstructable, clamped >= 2 {
+                return .reconstruct(step: step, pocStep: pocStep)
+            }
+        }
+
+        // One stepped-back slot is the container doing its job. `PTS != DTS` proves nothing here:
+        // libavformat synthesizes a decode ladder from a rising presentation one just as readily as
+        // from a reordered one, which is why the ISO-BMFF eligibility test cannot be reused.
+        if zip(slots, slots.dropFirst()).contains(where: { $1 < $0 }) { return .healthy }
+        guard !zip(slots, slots.dropFirst()).contains(where: { $1 == $0 }) else {
+            return .inconclusive("two pictures share a presentation slot")
+        }
         // The muxer invariant, checked on the window before a single packet is moved: a picture may
         // sit at most its own reorder delay behind the slot it owns, or its repaired presentation
         // time would land before the decode time the container states for it.
@@ -149,6 +215,68 @@ enum H264MatroskaSlotPermutation {
                 + "its own, past a reorder delay of \(videoDelay)")
         }
         return .permute(pocStep: pocStep)
+    }
+
+    struct CFRRewriter {
+        let step: Int64
+        let pocStep: Int64
+        let videoDelay: Int
+        private(set) var brokenReason: String?
+        private var anchorPTS: Int64?
+        private var decodeIndex: Int64 = 0
+
+        mutating func noteSeek() {
+            anchorPTS = nil
+            decodeIndex = 0
+            brokenReason = nil
+        }
+
+        mutating func rewrite(
+            pts: Int64, dts: Int64, pictureOrderCount: Int64?, isKeyframe: Bool
+        ) -> (pts: Int64, dts: Int64)? {
+            guard brokenReason == nil else { return nil }
+            if isKeyframe, pictureOrderCount == 0 {
+                anchorPTS = nil
+                decodeIndex = 0
+                if pts != Int64.min { anchorPTS = pts }
+            }
+            guard let anchorPTS else {
+                return nil
+            }
+            defer { decodeIndex += 1 }
+            guard let pictureOrderCount, pictureOrderCount >= 0, pocStep > 0,
+                  pictureOrderCount % pocStep == 0 else {
+                brokenReason = "a picture carries no usable picture order"
+                return nil
+            }
+            guard let expectedPTS = H264MatroskaSlotPermutation.timestamp(
+                    anchor: anchorPTS, index: pictureOrderCount / pocStep, step: step),
+                  let expectedDTS = H264MatroskaSlotPermutation.timestamp(
+                    anchor: anchorPTS, index: decodeIndex - Int64(videoDelay), step: step)
+            else {
+                brokenReason = "timestamp reconstruction overflowed"
+                return nil
+            }
+            guard expectedPTS >= expectedDTS else {
+                brokenReason = "reconstructed pts=\(expectedPTS) precedes dts=\(expectedDTS)"
+                return nil
+            }
+
+            let ptsForward = pts.subtractingReportingOverflow(expectedPTS)
+            let dtsForward = dts.subtractingReportingOverflow(expectedDTS)
+            let unsetDTS = dts == Int64.min
+            let ptsFits = pts == expectedPTS
+                || (!ptsForward.overflow && ptsForward.partialValue == step)
+            let dtsFits = dts == expectedDTS
+                || unsetDTS
+                || (!dtsForward.overflow && dtsForward.partialValue == step)
+            guard ptsFits, dtsFits else {
+                brokenReason = "the timestamp ladder changed shape "
+                    + "(pts=\(pts)/\(expectedPTS) dts=\(dts)/\(expectedDTS))"
+                return nil
+            }
+            return (expectedPTS, expectedDTS)
+        }
     }
 
     /// One coded video sequence, as the container hands it out. Values only, so the permutation is
@@ -257,7 +385,7 @@ enum H264MatroskaSlotPermutation {
 /// interleave waits with it, which is one mini-GOP and not one sequence.
 final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
 
-    enum Phase: Equatable { case sampling, permuting, off }
+    enum Phase: Equatable { case sampling, permuting, reconstructing, off }
 
     private struct Entry {
         let packet: UnsafeMutablePointer<AVPacket>
@@ -279,6 +407,8 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
     private var ready: [UnsafeMutablePointer<AVPacket>] = []
     private var pendingBytes = 0
     private var sequence: H264MatroskaSlotPermutation.Sequence?
+    private var cfrRewriter: H264MatroskaSlotPermutation.CFRRewriter?
+    private let nominalStep: Int64?
     private var verdictDescription = "sampling"
 
     /// nil unless this stream is the shape the defect needs: Matroska, H.264, and a bitstream that
@@ -299,6 +429,12 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
         self.streamIndex = streamIndex
         self.videoDelay = Int(codecpar.pointee.video_delay)
         self.reader = reader
+        let rate = stream.pointee.avg_frame_rate.num > 0 && stream.pointee.avg_frame_rate.den > 0
+            ? stream.pointee.avg_frame_rate : stream.pointee.r_frame_rate
+        let numerator = Int64(stream.pointee.time_base.den) * Int64(rate.den)
+        let denominator = Int64(stream.pointee.time_base.num) * Int64(rate.num)
+        nominalStep = denominator > 0 && numerator > 0 && numerator % denominator == 0
+            ? numerator / denominator : nil
     }
 
     deinit { releasePending() }
@@ -329,10 +465,28 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
             if samples.count >= H264MatroskaSlotPermutation.sampleTarget
                 || pendingBytes >= H264MatroskaSlotPermutation.sampleByteBudget
                 || pending.count >= H264MatroskaSlotPermutation.heldPacketCeiling
-                || earlyHealthyVerdict {
+                || (nominalStep == nil && earlyHealthyVerdict) {
                 decide()
             }
             return true
+        }
+        if phase == .reconstructing {
+            if isPicture, var rewriter = cfrRewriter {
+                applyCFRRepair(
+                    to: packet, pictureOrderCount: pictureOrderCount,
+                    using: &rewriter
+                )
+                cfrRewriter = rewriter
+                if let reason = rewriter.brokenReason {
+                    verdictDescription = "stopped (\(reason))"
+                    EngineLog.emit(
+                        "[Demuxer] Matroska H.264 CFR reconstruction stopped on stream "
+                        + "\(streamIndex): \(reason)", category: .demux)
+                    phase = .off
+                    cfrRewriter = nil
+                }
+            }
+            return false
         }
         let rank = isPicture ? admit(packet, pictureOrderCount: pictureOrderCount) : nil
         append(packet, isPicture: isPicture, pictureOrderCount: pictureOrderCount, rank: rank)
@@ -432,7 +586,7 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
     }
 
     /// A well-formed MKV with B-frames proves itself on the packet that steps back, which is normally
-    /// the third one, so it never pays the sample window.
+    /// the third one. Exact whole-tick CFR candidates keep sampling so duplicate slots can be checked.
     private var earlyHealthyVerdict: Bool {
         guard samples.count >= 2 else { return false }
         let last = samples[samples.count - 1]
@@ -441,7 +595,8 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
     }
 
     private func decide() {
-        let verdict = H264MatroskaSlotPermutation.classify(samples: samples, videoDelay: videoDelay)
+        let verdict = H264MatroskaSlotPermutation.classify(
+            samples: samples, videoDelay: videoDelay, nominalStep: nominalStep)
         switch verdict {
         case .permute(let pocStep):
             verdictDescription = "permute pocStep=\(pocStep)"
@@ -463,6 +618,23 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
                 pending[index].rank = rank
             }
             drain()
+        case .reconstruct(let step, let pocStep):
+            verdictDescription = "reconstruct step=\(step) pocStep=\(pocStep)"
+            phase = .reconstructing
+            var rewriter = H264MatroskaSlotPermutation.CFRRewriter(
+                step: step, pocStep: pocStep, videoDelay: videoDelay)
+            for entry in pending where entry.isPicture {
+                applyCFRRepair(
+                    to: entry.packet, pictureOrderCount: entry.pictureOrderCount,
+                    using: &rewriter
+                )
+            }
+            cfrRewriter = rewriter
+            flushPendingUntouched()
+            EngineLog.emit(
+                "[Demuxer] Matroska H.264 clamped CFR timestamps confirmed on stream "
+                + "\(streamIndex): \(verdictDescription) samples=\(samples.count)",
+                category: .demux)
         case .healthy:
             verdictDescription = "healthy"
             disarm()
@@ -502,6 +674,7 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
         reader.reset()
         if phase == .sampling { samples.removeAll(keepingCapacity: true) }
         sequence?.noteSeek()
+        cfrRewriter?.noteSeek()
     }
 
     private func releasePending() {
@@ -526,5 +699,18 @@ final class H264MatroskaSlotPermutationSession: H264TimestampRepairSession {
         "phase=\(phase) verdict=\(verdictDescription) "
             + "repaired=\(sequence?.repairedPictures ?? 0) "
             + "unrepaired=\(sequence?.unrepairedPictures ?? 0)"
+    }
+
+    private func applyCFRRepair(
+        to packet: UnsafeMutablePointer<AVPacket>,
+        pictureOrderCount: Int64?,
+        using rewriter: inout H264MatroskaSlotPermutation.CFRRewriter
+    ) {
+        if let repaired = rewriter.rewrite(
+            pts: packet.pointee.pts, dts: packet.pointee.dts,
+            pictureOrderCount: pictureOrderCount, isKeyframe: isKeyframe(packet)) {
+            packet.pointee.pts = repaired.pts
+            packet.pointee.dts = repaired.dts
+        }
     }
 }

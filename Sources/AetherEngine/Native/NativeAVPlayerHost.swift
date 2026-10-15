@@ -47,6 +47,9 @@ final class NativeAVPlayerHost {
     /// AE#495: what the AE#495 relay knows about the origin's certificate, when the item this host
     /// plays is served by one. Set by the engine at mount, read only while classifying a failure.
     var upstreamTrustRefusal: (@Sendable () -> Int?)?
+    /// AE#682: whether the session's server withheld its I-frame playlist from this item (see
+    /// `MasterFallbackDecision.isMasterRejection(_:mediaErrorCodes:iFramePlaylistWithheld:)`).
+    var iFramePlaylistWithheld: (@Sendable () -> Bool)?
     /// AE#561: what the session can still offer when AVPlayer refuses the media, answered by the
     /// engine because the host owns none of it. Set at mount, read only while classifying a failure.
     var softwarePathAvailability: (@Sendable () -> SoftwarePathEscalation.Availability?)?
@@ -1075,8 +1078,10 @@ final class NativeAVPlayerHost {
                 return
             }
             if let error = item.error as NSError?, MasterFallbackDecision.isMasterRejection(error,
-                mediaErrorCodes: item.errorLog()?.events.map(\.errorStatusCode) ?? []) {
-                let code = error.code
+                mediaErrorCodes: item.errorLog()?.events.map(\.errorStatusCode) ?? [],
+                iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false) {
+                let code = MasterFallbackDecision.rejectionCode(for: error,
+                    iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false)
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
                     + "(code=\(code)); signalling engine for media fallback instead of surfacing",

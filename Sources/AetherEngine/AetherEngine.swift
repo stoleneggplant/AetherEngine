@@ -5321,9 +5321,14 @@ public final class AetherEngine: ObservableObject {
                         category: .engine
                     )
                 }
-                activeVideoDecoder = composesFEL
+                // `sourceComposesDolbyVisionFEL`, not `composesFEL`: `loadSoftware` clears it when the
+                // dual-layer decoder could not open and the host fell back to the base layer.
+                activeVideoDecoder = sourceComposesDolbyVisionFEL
                     ? Self.dolbyVisionFELDecoderLabel
-                    : Self.videoDecoderLabel(codecID: detectedCodecID, isSoftware: true)
+                    : Self.videoDecoderLabel(
+                        codecID: detectedCodecID,
+                        isSoftware: !(softwareHost?.usesHardwareVideoDecoder ?? false)
+                    )
                 // AE#462: the host's own resolved index, not the engine's pick. The pick says which
                 // track was ASKED for; only the host knows whether a decoder opened for it, and this
                 // label claimed one for a session that had dropped its audio and gone video-only.

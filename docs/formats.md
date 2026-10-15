@@ -57,9 +57,15 @@ zero). A source is only repaired when every sampled pair is equal, the decode la
 picture order regresses, and the ranks it produces are distinct and fill the sampled window (or a
 decode-order prefix of at least nine pictures fills its own range exactly, which covers a
 hierarchical mini-GOP longer than the reorder delay, #699). Anything
-short of that (variable frame timing, a picture order that does not advance one rank per picture, a
+short of that (a picture order that does not advance one rank per picture, a
 sample that starts nowhere it can be anchored) is delivered exactly as the container wrote it.
 Reported by @orut34iop; the HEVC case (#699) by @ijuniorfu.
+
+For H.264 only, a changing decode cadence can instead use the original-slot policy described below.
+This fallback requires a progressive IDR head with equal PTS/DTS, a container start/index lead that
+exactly matches the observed reorder head, and a complete, distinct picture-order prefix whose
+timestamps pass the slot policy. It assigns existing slots plus that lead rather than fitting a
+frame rate; DTS, audio and the keyframe index remain unchanged. An ambiguous head stays untouched.
 
 ### Matroska with presentation slots in coding order
 
@@ -104,10 +110,9 @@ offsets. Seeking into that region can produce persistent judder despite normal
 aggregate FPS and sufficient network buffering.
 
 When a healthy origin picture corroborates the container's edit/index lead, the
-demuxer keeps a zero-hold healthy path and watches for zero-offset IDRs. One
-bounded, complete IDR-to-IDR progressive sequence is parsed for picture order.
-If every selected packet has valid equal PTS/DTS and its distinct even POC fills
-the complete sequence, a proven permutation assigns its original DTS slots plus
+demuxer keeps a zero-hold healthy path and watches for zero-offset IDRs. Progressive
+pictures are parsed as they arrive. Valid equal PTS/DTS and distinct even POC let
+the streaming slot ladder assign original DTS slots plus
 the corroborated presentation lead by display rank. Original DTS, audio and the
 already published keyframe index never move. Actual timestamp slots, rather than
 an average-FPS clock, preserve interval changes and quantization within a sequence.
@@ -115,8 +120,11 @@ an average-FPS clock, preserve interval changes and quantization within a sequen
 The slot a picture needs is a packet away, not a plan away, exactly as in the Matroska
 policy above: a picture coded ahead of its own slot waits the mini-GOP the reorder
 created, so nothing waits for the end of a sequence and no sequence is too long to
-repair. The wait is bounded by the reorder delay the container declares, believed up
-to **16 pictures**, and the packets held behind it by **1024 interleaved packets and
+repair. Backward displacement remains bounded by the declared reorder delay. A forward-coded
+anchor farther ahead needs a bounded, complete decode-prefix proof, as in #700: distinct ranks
+fill a prefix, the backward delay still fits, and the observed slots plus lead pass a dry run.
+Only the measured forward distance is then allowed, limited to **16 pictures**; that proof resets
+at each candidate IDR. The packets held behind it remain bounded by **1024 interleaved packets and
 32 MiB**, which is a ceiling on a container's interleaving rather than on its GOP.
 A candidate sequence has to show its reordering within **64 pictures** before a single
 picture is rewritten.
@@ -127,7 +135,8 @@ not guessed at. **Every refusal hands the held packets back exactly as they arri
 and lets the rest of that sequence stream through, so a shape this policy does not own
 costs the repair and never the session; the next IDR is a fresh candidate. Seek and
 teardown release both unpublished input and pending output. No decoder-route or host-UI
-change is needed. The existing whole-file missing-offset policy above remains separate.
+change is needed. The uniform whole-file policy above is unchanged; its strictly proven
+variable-cadence H.264 fallback reuses this same slot ladder.
 
 See the [partial-composition regression and reproduction](partial-composition-regression.md)
 for generated fixtures, original numeric evidence and verification limits.
@@ -534,6 +543,8 @@ Both: no decryption (CSS / AACS retail discs must be ripped decrypted first), no
 A remote `.iso` / `.img` / `.udf` needs an origin that honours HTTP `Range`, because a disc image is a filesystem that only random access can walk. The range probe is judged at the response head: an origin that answers it with a 200 fails the load with an error naming the cause (the body is never downloaded), and a range answered wider than asked is cut where the range ends.
 
 **Blu-ray folders.** A disc that was ripped as a `BDMV` folder rather than an image plays the same way through `MediaSource.custom` with a `DiscDirectoryReader`: the host lists the folder's files (path relative to the disc root, and size) and opens any one of them on request. `HTTPDiscDirectoryReader` is the ready-made one, with one URL per file, so an origin serves the disc as plain files over `Range` and never remuxes it. Recognition is the image path with files in place of UDF extents: the same bounded playlist scan and title selection, the selected title's `.m2ts` files concatenated in playlist order as one MPEG-TS, the same multi-clip timeline, chapters and STN track languages, and the same seek by the clips' EP maps when the folder carries `BDMV/CLIPINF`. A host that already knows the main playlist names it in `preferredPlaylist`, and only that playlist is read and published as the title. The concatenating reader opens a clip's file when the read reaches it and keeps at most three open. A controlled probe (`limits` or `cancellation`) does not recognize a folder yet; an uncontrolled `probe(source:)` and `load(source:)` do.
+
+**DVD-Video folders.** A listing that holds `VIDEO_TS/` files and no playable Blu-ray title is read as DVD-Video instead, by the same title-set code as an image: the selected title set's VOBs are concatenated in part order, which is the same run of bytes as their sectors on a disc, so the cell timeline and the VTS time map apply unchanged. `preferredPlaylist` does not apply.
 
 **Title selection.** `engine.discTitles` (`@Published [TitleInfo]`) lists the disc's titles (id, name, duration, chapter count) and `engine.selectedDiscTitle` is the active one; `engine.selectTitle(id:)` switches title, rebuilding the pipeline from the new title's head. The selection survives audio-track switches and background-resume reloads, and a fresh `load` defaults to the main title (an out-of-range id clamps to it). Blu-ray enumerates all playlists; a DVD enumerates its title sets (the VMGI TT_SRPT title list, resolved whole-VTS, with the duration read from each VTS's main program chain; per-cell / episodic splitting is deferred).
 

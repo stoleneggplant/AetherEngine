@@ -1,15 +1,16 @@
 import Foundation
 
-/// A Blu-ray disc that a host serves as a FOLDER (the `BDMV` tree, one address per file) rather than
-/// as a single image. Hand one to `load(source: .custom(reader))`: the engine reads the playlists,
-/// selects the title and concatenates its clips the same way it does for a Blu-ray ISO, so titles,
-/// chapters, track languages and the multi-clip timeline (AE#105) all behave as they do there.
+/// A disc that a host serves as a FOLDER (the `BDMV` or `VIDEO_TS` tree, one address per file) rather
+/// than as a single image. Hand one to `load(source: .custom(reader))`: the engine selects the title and
+/// concatenates its clips or VOBs the same way it does for an ISO, so titles, chapters, track languages,
+/// the multi-clip and multi-cell timelines and the seek tables all behave as they do there. As on an
+/// image, Blu-ray is tried first and a listing with `VIDEO_TS/` in it falls back to DVD-Video.
 ///
 /// A folder carries no bytes of its own: `read` is never called on it. The engine recognizes the
 /// conformance before it reads anything and opens the files it needs through `openDiscFile(_:)`.
 public protocol DiscDirectoryReader: IOReader {
     /// Every file of the disc that can be read: its path relative to the disc root, with `/` as the
-    /// separator (`BDMV/STREAM/00001.m2ts`), and its size in bytes.
+    /// separator (`BDMV/STREAM/00001.m2ts`, `VIDEO_TS/VTS_01_1.VOB`), and its size in bytes.
     var discFiles: [(path: String, size: Int64)] { get }
 
     /// A new, independent reader over one file of `discFiles` (matched case-insensitively), or nil when
@@ -18,11 +19,11 @@ public protocol DiscDirectoryReader: IOReader {
 
     /// The `.mpls` file name of the title to play (`00800.mpls`), when the host already knows it. The
     /// engine then reads only that playlist and publishes it as the only title; nil reads every playlist
-    /// and selects the main title by the engine's own rules, as on an ISO.
+    /// and selects the main title by the engine's own rules, as on an ISO. Blu-ray only.
     var preferredPlaylist: String? { get }
 }
 
-/// A Blu-ray folder over HTTP: one URL per file, each read through its own range reader, so an origin
+/// A disc folder over HTTP: one URL per file, each read through its own range reader, so an origin
 /// serves the disc as plain files and never remuxes it.
 public final class HTTPDiscDirectoryReader: DiscDirectoryReader {
     public struct File: Sendable {
@@ -239,6 +240,40 @@ final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecke
 }
 
 extension DiscReader {
+    /// A DVD-Video folder: the image path (`wrapDVD`) with files in place of sector ranges. A title set's
+    /// VOBs follow each other in part order, which is the same run of bytes as their sectors on a disc, so
+    /// the cell spans and the time map from its VTS IFO apply unchanged.
+    static func wrapDVDFolder(_ folder: DiscDirectoryReader, selectTitleID: Int?) -> DiscInfo? {
+        // Only VIDEO_TS's own files; a folder has no sectors, so each file is listed by name and size.
+        let entries = folder.discFiles.filter { $0.path.uppercased().hasPrefix("VIDEO_TS/") }
+        var byName: [String: (path: String, size: Int64)] = [:]
+        let files = entries.compactMap { entry -> DiscFile? in
+            let name = String(entry.path.split(separator: "/").last ?? "")
+            guard !name.isEmpty, entry.size > 0, entry.size <= Int64(Int.max) else { return nil }
+            byName[name.uppercased()] = entry
+            return DiscFile(name: name, startSector: 0, length: Int(entry.size))
+        }
+        let readFile: (DiscFile) -> [UInt8] = { file in
+            guard let entry = byName[file.name.uppercased()], let reader = folder.openDiscFile(entry.path) else { return [] }
+            defer { reader.close() }
+            return readAll(reader, [(offset: 0, length: entry.size)])
+        }
+        guard let set = dvdTitleSet(files: files, selectTitleID: selectTitleID, readFile: readFile) else {
+            EngineLog.emit("[disc] VIDEO_TS folder: no title VOBs among \(entries.count) files", category: .demux)
+            return nil
+        }
+        let segments = set.vobs.compactMap { vob in
+            byName[vob.name.uppercased()].map { MultiFileConcatIOReader.Segment(path: $0.path, size: $0.size) }
+        }
+        guard !segments.isEmpty else { return nil }
+        let (cellTimeline, timeMap) = set.selectedIFO.map(dvdCellTimeline) ?? ([], nil)
+        EngineLog.emit("[disc] DVD-Video folder recognized: \(set.titles.count) title(s), selected \(set.selectedIndex) "
+                       + "VOBs=\(segments.map(\.path)) bytes=\(segments.reduce(0) { $0 + $1.size })", category: .demux)
+        return DiscInfo(reader: MultiFileConcatIOReader(segments: segments, opener: { folder.openDiscFile($0) }),
+                        formatHint: "mpeg", titles: set.titles, selectedTitleIndex: set.selectedIndex,
+                        clipTimeline: cellTimeline, dvdTimeMap: timeMap)
+    }
+
     /// A Blu-ray folder: the image path (`wrapBluRay`) with files in place of UDF extents. The playlist scan
     /// and the clip assembly are the same bounded code, so a folder cannot make recognition do more than
     /// an image can (audit NET-103).

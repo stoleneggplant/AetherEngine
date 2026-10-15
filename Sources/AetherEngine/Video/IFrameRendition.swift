@@ -3,8 +3,24 @@ import Foundation
 
 /// What the segment provider needs from an I-frame rendition (AE#682).
 protocol IFrameSegmentSource: AnyObject, Sendable {
+    var format: IFrameRenditionFormat { get }
     func initSegment() -> Data?
     func fragment(at index: Int) -> Data?
+}
+
+/// What the I-frame rendition carries, and so what the master declares for it.
+enum IFrameRenditionFormat: Equatable, Sendable {
+    /// The source's own keyframes; the master repeats the variant's codec, range and size.
+    case keyframes
+    /// One SDR Motion JPEG still per keyframe (`IFrameJPEGBuilder`), for HDR and Dolby Vision sources.
+    case jpeg(width: Int, height: Int, bandwidth: Int)
+
+    var logName: String {
+        switch self {
+        case .keyframes: return "keyframes"
+        case .jpeg: return "jpeg"
+        }
+    }
 }
 
 /// AE#682: answers `iframe_init.mp4` and `iframe{N}.mp4`. One request at a time: there is one side
@@ -16,6 +32,7 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
         let durationSeconds: Double
     }
 
+    let format: IFrameRenditionFormat
     private let entries: [Entry]
     private let cache: IFramePayloadCache
     private let readPayload: (Entry) -> Data?
@@ -33,12 +50,14 @@ final class IFrameRendition: IFrameSegmentSource, @unchecked Sendable {
 
     init(entries: [Entry],
          cache: IFramePayloadCache,
+         format: IFrameRenditionFormat = .keyframes,
          readPayload: @escaping (Entry) -> Data?,
          buildFragment: @escaping (Data, Int, Entry) -> IFrameFragmentBuilder.Output?,
          waitForLink: @escaping (_ shouldStop: () -> Bool) -> Void = { _ in },
          sourceReadsAllowed: @escaping () -> Bool = { true },
          interruptReads: @escaping () -> Void = {},
          closeReader: @escaping () -> Void = {}) {
+        self.format = format
         self.entries = entries
         self.cache = cache
         self.readPayload = readPayload

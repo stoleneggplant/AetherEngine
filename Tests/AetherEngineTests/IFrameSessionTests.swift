@@ -66,6 +66,7 @@ struct IFrameSessionTests {
         #expect(playbackURL.lastPathComponent == "master.m3u8")
         let prov = try #require(engine.provider)
         #expect(prov.iFrameRenditionServed)
+        #expect(prov.iFrameRenditionFormat == .keyframes)
         try #require(prov.segmentCount >= 2)
 
         let initSegment = try #require(prov.iFrameInitSegment())
@@ -79,6 +80,56 @@ struct IFrameSessionTests {
                     "iframe\(index) sits at \(tfdt / timescale), plan says \(engine.segmentPlan[index].startSeconds)")
         }
         #expect(prov.iFrameSegment(at: prov.segmentCount) == nil)
+    }
+
+    private static let dolbyVisionFixture = "user/Patterns_Of_Nature_DoVi_24_P5_UHD_HEVC-10mbps_DD+JOC-768kbps_iOS.mp4"
+
+    @Test("a Dolby Vision session serves SDR JPEG stills on the plan's timeline",
+          .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
+    func dolbyVisionServesJPEG() throws {
+        let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
+        engine.requestIFramePlaylist()
+        _ = try engine.start()
+        defer { engine.stop() }
+        try #require(engine.iFrameRenditionVerdict == .served)
+        let prov = try #require(engine.provider)
+        guard case .jpeg(let width, let height, _) = prov.iFrameRenditionFormat else {
+            Issue.record("expected a JPEG rendition, got \(String(describing: prov.iFrameRenditionFormat))")
+            return
+        }
+        #expect(width == 640 && height == 360)
+        let master = HLSLocalServer.buildMasterPlaylistText(provider: prov)
+        #expect(master.contains("CODECS=\"mjpg\",RESOLUTION=640x360,VIDEO-RANGE=SDR"))
+        let initSegment = try #require(prov.iFrameInitSegment())
+        let timescale = Double(try #require(IFrameTestBoxes.timescale(initSegment: initSegment)))
+        for index in [prov.segmentCount - 1, 2] {
+            let fragment = try #require(prov.iFrameSegment(at: index))
+            let tfdt = Double(try #require(IFrameTestBoxes.baseDecodeTime(fragment: fragment)))
+            #expect(abs(tfdt / timescale - engine.segmentPlan[index].startSeconds) < 0.002)
+            let mdat = try #require(IFrameTestBoxes.find(["mdat"], in: fragment))
+            #expect(fragment.subdata(in: mdat).prefix(2) == Data([0xFF, 0xD8]))
+        }
+    }
+
+    @Test("a JPEG I-frame playlist waits for the main variant and is withheld from a player that refused it",
+          .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
+    func jpegPlaylistFollowsMainVariant() throws {
+        let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
+        engine.requestIFramePlaylist()
+        let playbackURL = try engine.start()
+        defer { engine.stop() }
+        let base = playbackURL.deletingLastPathComponent()
+        let playlistURL = base.appendingPathComponent("iframe.m3u8")
+
+        let started = Date()
+        #expect(!engine.iFrameRenditionWithheld)
+        #expect((try? String(contentsOf: playlistURL, encoding: .utf8)) == nil)
+        #expect(Date().timeIntervalSince(started) >= HLSLocalServer.iFrameMainVariantWaitSeconds - 0.1)
+        #expect(engine.iFrameRenditionWithheld)
+
+        _ = try Data(contentsOf: base.appendingPathComponent("init.mp4"))
+        let playlist = try String(contentsOf: playlistURL, encoding: .utf8)
+        #expect(playlist.contains("iframe1.mp4"))
     }
 
     @Test("the loopback server answers the three new paths",

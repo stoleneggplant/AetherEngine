@@ -622,6 +622,7 @@ final class H264CompositionOffsetRepairSession {
     private let partialRepairCandidate: H264PartialCompositionRepairSession?
     private var monitorsPartialOffsets = false
     private var samples: [H264CompositionOffsetRepair.Sample] = []
+    private var sampledFramePictures = true
     private var held: [(packet: UnsafeMutablePointer<AVPacket>, pictureOrderCount: Int64?)] = []
     private var heldBytes = 0
     private var verdictDescription = "sampling"
@@ -701,6 +702,7 @@ final class H264CompositionOffsetRepairSession {
             var pictureOrderCount: Int64?
             if packet.pointee.stream_index == streamIndex {
                 pictureOrderCount = reader?.pictureOrderCount(for: packet)
+                sampledFramePictures = sampledFramePictures && reader?.isFramePicture == true
                 samples.append(
                     H264CompositionOffsetRepair.Sample(
                         dts: packet.pointee.dts,
@@ -801,6 +803,7 @@ final class H264CompositionOffsetRepairSession {
         case .sampling:
             // The sample restarts where the source now stands.
             samples.removeAll(keepingCapacity: true)
+            sampledFramePictures = true
         case .repairing:
             rewriter?.noteSeek()
             reader?.reset()
@@ -882,6 +885,25 @@ final class H264CompositionOffsetRepairSession {
             verdictDescription = "healthy"
             disarm()
         case .inconclusive(let reason):
+            if reason == "decode ladder is not uniform", sampledFramePictures,
+               let candidate = partialRepairCandidate,
+               let forwardDepth = H264PartialCompositionRepair.missingHeadForwardDepth(
+                   dts: samples.map(\.dts), pts: samples.map(\.pts),
+                   pocs: samples.map(\.pictureOrderCount), keys: samples.map(\.isKeyframe),
+                   streamStart: streamStartTime, ladderStart: ladderStart, reorderDepth: videoDelay),
+               let firstPacket = held.first(where: { $0.packet.pointee.stream_index == streamIndex })?.packet,
+               candidate.enableMissingHead(forwardDepth: forwardDepth, firstPacket: firstPacket) {
+                // Reuse #513's streaming slots. Hand over each interleaved packet once;
+                // leading non-video packets remain ahead of the candidate's queue.
+                monitorsPartialOffsets = true
+                disarm()
+                let input = held
+                held.removeAll(keepingCapacity: false)
+                heldBytes = 0
+                for entry in input where !candidate.ingest(entry.packet) { held.append(entry) }
+                samples.removeAll(keepingCapacity: false)
+                return
+            }
             verdictDescription = "inconclusive (\(reason))"
             // Only worth a line when the stream looked like a candidate: a file that simply carries
             // composition offsets is the normal case and says nothing.

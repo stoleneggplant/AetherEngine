@@ -27,7 +27,7 @@ struct DVDCellTimelineTests {
     }
 
     /// A PGC whose cell playback table holds `cells`, one program per cell.
-    private static func pgc(_ cells: [CellSpec]) -> [UInt8] {
+    static func pgc(_ cells: [CellSpec]) -> [UInt8] {
         var pgc = [UInt8](repeating: 0, count: 0xEC)
         pgc[2] = UInt8(cells.count)
         pgc[3] = UInt8(cells.count)

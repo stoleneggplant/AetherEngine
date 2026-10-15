@@ -32,3 +32,17 @@ ffmpeg -hide_banner -loglevel error -n \
 ruby "$TASK_ROOT/Scripts/tests/make-partial-ctts-fixture.rb" \
   "$TASK_TMP/healthy-scenecut.mp4" "$TASK_TMP/variable.mp4" tail 300 1200 1200
 bash "$TASK_ROOT/Scripts/test-h264-partial-composition-runtime.sh" "$TASK_TMP/variable.mp4" 0 12 0
+
+# Entire missing-offset head with a decode cadence change, plus its untouched healthy control.
+python3 "$TASK_ROOT/Scripts/tests/make-missing-head-fixture.py" "$TASK_TMP"
+bash "$TASK_ROOT/Scripts/test-h264-partial-composition-runtime.sh" "$TASK_TMP/missing-head.mp4" 0 1.5 0 20 40
+bash "$TASK_ROOT/Scripts/test-h264-partial-composition-runtime.sh" "$TASK_TMP/healthy-head.mp4" 0
+
+# Hierarchical B pictures: forward distance 3, declared backward depth 2. The healthy twin
+# supplies an exact PTS oracle for both a damaged tail and a damaged middle with recovery.
+python3 "$TASK_ROOT/Scripts/tests/make-missing-head-fixture.py" "$TASK_TMP" --partial-hierarchical
+AETHER_TIMESTAMP_HEALTHY_TWIN="$TASK_TMP/healthy-b3.mp4" \
+  bash "$TASK_ROOT/Scripts/test-h264-partial-composition-runtime.sh" "$TASK_TMP/tail-b3.mp4" 0 12 0 6 22
+AETHER_TIMESTAMP_HEALTHY_TWIN="$TASK_TMP/healthy-b3.mp4" \
+  bash "$TASK_ROOT/Scripts/test-h264-partial-composition-runtime.sh" "$TASK_TMP/middle-b3.mp4" 0 12 0 6 18 22
+bash "$TASK_ROOT/Scripts/test-h264-partial-composition-runtime.sh" "$TASK_TMP/healthy-b3.mp4" 0

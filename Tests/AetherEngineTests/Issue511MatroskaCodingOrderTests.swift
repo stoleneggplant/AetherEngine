@@ -88,6 +88,16 @@ struct Issue511MatroskaCodingOrderTests {
         #expect(Permutation.classify(samples: window, videoDelay: 1) == .permute(pocStep: 2))
     }
 
+    @Test("coding-order slots on a whole-tick CFR lattice still permute rather than reconstruct")
+    func codingOrderOnWholeTickLatticeStillPermutes() {
+        let count = Permutation.sampleTarget
+        let slots = (0..<count).map { Int64($0) * 40 }
+        let window = Self.samples(
+            slots: slots, pocs: Array(Self.reportedPictureOrder.prefix(count)))
+        #expect(Permutation.classify(samples: window, videoDelay: 1, nominalStep: 40)
+            == .permute(pocStep: 2))
+    }
+
     @Test("every picture carries the slot its own display rank owns, and the multiset is the file's")
     func permutesTheReportedSequence() throws {
         let sequenceSamples = Array(
@@ -165,6 +175,104 @@ struct Issue511MatroskaCodingOrderTests {
         #expect(Permutation.classify(samples: Array(healthy), videoDelay: 1) == .healthy)
         // Three packets are enough: I, the P that follows it, and the first B between them.
         #expect(Permutation.classify(samples: Array(healthy.prefix(3)), videoDelay: 1) == .healthy)
+    }
+
+    @Test("clamped CFR B-picture timestamps are reconstructed from picture order")
+    func reconstructsClampedCFR() throws {
+        let n = Int64.min
+        let samples = [
+            Sample(dts: n, pts: 0, pictureOrderCount: 0, isKeyframe: true),
+            Sample(dts: n, pts: 200, pictureOrderCount: 10, isKeyframe: false),
+            Sample(dts: 0, pts: 80, pictureOrderCount: 4, isKeyframe: false),
+            Sample(dts: 80, pts: 80, pictureOrderCount: 2, isKeyframe: false),
+            Sample(dts: 80, pts: 120, pictureOrderCount: 6, isKeyframe: false),
+            Sample(dts: 120, pts: 160, pictureOrderCount: 8, isKeyframe: false),
+            Sample(dts: 160, pts: 440, pictureOrderCount: 22, isKeyframe: false),
+            Sample(dts: 200, pts: 320, pictureOrderCount: 16, isKeyframe: false),
+            Sample(dts: 280, pts: 280, pictureOrderCount: 12, isKeyframe: false),
+            Sample(dts: 280, pts: 280, pictureOrderCount: 14, isKeyframe: false),
+            Sample(dts: 320, pts: 360, pictureOrderCount: 18, isKeyframe: false),
+            Sample(dts: 360, pts: 400, pictureOrderCount: 20, isKeyframe: false),
+        ]
+        #expect(Permutation.classify(samples: samples, videoDelay: 2, nominalStep: 40)
+            == .reconstruct(step: 40, pocStep: 2))
+
+        let repairedPTS: [Int64] = [0, 200, 80, 40, 120, 160, 440, 320, 240, 280, 360, 400]
+        let repairedDTS: [Int64] = [-80, -40, 0, 40, 80, 120, 160, 200, 240, 280, 320, 360]
+        let healthy = zip(samples.indices, samples).map { index, sample in
+            Sample(
+                dts: repairedDTS[index], pts: repairedPTS[index],
+                pictureOrderCount: sample.pictureOrderCount, isKeyframe: sample.isKeyframe)
+        }
+        #expect(Permutation.classify(samples: healthy, videoDelay: 2, nominalStep: 40) == .healthy)
+        #expect(Permutation.classify(samples: samples, videoDelay: 2, nominalStep: Int64.max)
+            == .healthy)
+        var oneClamp = samples
+        oneClamp[8] = Sample(
+            dts: 240, pts: 240, pictureOrderCount: 12, isKeyframe: false)
+        #expect(Permutation.classify(samples: oneClamp, videoDelay: 2, nominalStep: 40)
+            == .healthy)
+
+        var rewriter = Permutation.CFRRewriter(step: 40, pocStep: 2, videoDelay: 2)
+        let repaired = samples.map {
+            rewriter.rewrite(
+                pts: $0.pts, dts: $0.dts, pictureOrderCount: $0.pictureOrderCount,
+                isKeyframe: $0.isKeyframe)
+        }
+        #expect(try repaired.map { try #require($0).pts } == repairedPTS)
+        #expect(try repaired.map { try #require($0).dts } == repairedDTS)
+
+        #expect(rewriter.rewrite(
+            pts: n, dts: n, pictureOrderCount: 0, isKeyframe: true) == nil)
+        #expect(rewriter.rewrite(
+            pts: 480, dts: 400, pictureOrderCount: 2, isKeyframe: false) == nil)
+        #expect(rewriter.rewrite(
+            pts: 1_000, dts: n, pictureOrderCount: 0, isKeyframe: true)?.pts == 1_000)
+        _ = rewriter.rewrite(
+            pts: 1_200, dts: n, pictureOrderCount: 10, isKeyframe: false)
+        _ = rewriter.rewrite(
+            pts: 1_080, dts: 1_000, pictureOrderCount: 4, isKeyframe: false)
+        #expect(rewriter.rewrite(
+            pts: 1_160, dts: n, pictureOrderCount: 6, isKeyframe: false)?.pts == 1_120)
+        #expect(rewriter.rewrite(
+            pts: 1_200, dts: 1_120, pictureOrderCount: 8, isKeyframe: false)?.dts == 1_080)
+
+        var broken = Permutation.CFRRewriter(step: 40, pocStep: 2, videoDelay: 2)
+        _ = broken.rewrite(pts: 0, dts: n, pictureOrderCount: 0, isKeyframe: true)
+        #expect(broken.rewrite(pts: 200, dts: n, pictureOrderCount: nil, isKeyframe: false) == nil)
+        #expect(broken.brokenReason != nil)
+        #expect(broken.rewrite(pts: 80, dts: 0, pictureOrderCount: 4, isKeyframe: false) == nil)
+    }
+
+    @Test("a clamp whose reconstruction would present before it decodes is left alone")
+    func clampReconstructingBeforeDecodeFailsClosed() {
+        let n = Int64.min
+        let samples = [
+            Sample(dts: n, pts: 0, pictureOrderCount: 0, isKeyframe: true),
+            Sample(dts: n, pts: 200, pictureOrderCount: 10, isKeyframe: false),
+            Sample(dts: 0, pts: 80, pictureOrderCount: 4, isKeyframe: false),
+            Sample(dts: 80, pts: 80, pictureOrderCount: 2, isKeyframe: false),
+            Sample(dts: 80, pts: 120, pictureOrderCount: 6, isKeyframe: false),
+            Sample(dts: 120, pts: 160, pictureOrderCount: 8, isKeyframe: false),
+            Sample(dts: 160, pts: 440, pictureOrderCount: 22, isKeyframe: false),
+            Sample(dts: 200, pts: 320, pictureOrderCount: 16, isKeyframe: false),
+            Sample(dts: 240, pts: 280, pictureOrderCount: 14, isKeyframe: false),
+            // Rank 6 decoded at index 9: its slot 240 would sit before the decode slot 280.
+            Sample(dts: 280, pts: 280, pictureOrderCount: 12, isKeyframe: false),
+            Sample(dts: 320, pts: 360, pictureOrderCount: 18, isKeyframe: false),
+            Sample(dts: 360, pts: 400, pictureOrderCount: 20, isKeyframe: false),
+        ]
+        #expect(Permutation.classify(samples: samples, videoDelay: 2, nominalStep: 40) == .healthy)
+
+        var rewriter = Permutation.CFRRewriter(step: 40, pocStep: 2, videoDelay: 2)
+        let repaired = samples.map {
+            rewriter.rewrite(
+                pts: $0.pts, dts: $0.dts, pictureOrderCount: $0.pictureOrderCount,
+                isKeyframe: $0.isKeyframe)
+        }
+        #expect(repaired[8] != nil)
+        #expect(repaired[9] == nil)
+        #expect(rewriter.brokenReason?.contains("precedes") == true)
     }
 
     @Test("shapes this permutation does not describe are left alone")
