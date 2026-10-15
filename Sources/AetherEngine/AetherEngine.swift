@@ -1575,6 +1575,18 @@ public final class AetherEngine: ObservableObject {
         forceSoftwarePathForTesting = on
     }
 
+    /// TEST-ONLY (AE#702): compose every HEVC Profile 7 dual-layer, whatever the display, the device's
+    /// Dolby Vision decode, the host option and the enhancement-layer type say. A Metal GPU, hardware HEVC
+    /// decode and a seekable VOD with length-prefixed samples are still required, because nothing
+    /// composes without them. Set only via `setForceDualLayerDolbyVisionForTesting(_:)`.
+    nonisolated(unsafe) static var forceDualLayerDolbyVisionForTesting = false
+
+    /// TEST-ONLY. Flip the dual-layer override for `aetherctl play --force-dual-layer`, which is how a
+    /// Mac (no Dolby Vision display or decode to report) runs the composition path; not for app use.
+    public nonisolated static func setForceDualLayerDolbyVisionForTesting(_ on: Bool) {
+        forceDualLayerDolbyVisionForTesting = on
+    }
+
     /// TEST-ONLY: makes every audio pipeline fail to build, so the AE#462 video-only drop is
     /// reachable without a source whose codec this FFmpeg build has no decoder for. Honored by the
     /// loopback cascade and by `SoftwarePlaybackHost`'s decoder open. Set only via
@@ -5225,6 +5237,18 @@ public final class AetherEngine: ObservableObject {
                     }
                 }
                 composesFEL = DolbyVisionFELPolicy.composes(felInputs)
+            }
+            // TEST-ONLY: the harness override. Everything a composition cannot run without still holds.
+            if Self.forceDualLayerDolbyVisionForTesting, !composesFEL, felInputs.dvProfile == 7,
+               !felInputs.isLive, felInputs.sourceIsSeekable, felInputs.samplesAreLengthPrefixed {
+                let missing = DolbyVisionFELDecoder.deviceShortfall(decodesDolbyVision: true)
+                composesFEL = missing == nil
+                EngineLog.emit(
+                    composesFEL
+                        ? "[AetherEngine] AE#702 TEST override: forcing dual-layer composition of this Profile 7 "
+                          + "(enhancement layer \(felInputs.enhancementLayerType ?? "unread"))"
+                        : "[AetherEngine] AE#702 TEST override refused: \(missing ?? "")",
+                    category: .engine)
             }
             // AE#702: a host that opted in gets one line saying which way a Profile 7 went, and why.
             if options.preferDualLayerDolbyVision, felInputs.dvProfile == 7 {

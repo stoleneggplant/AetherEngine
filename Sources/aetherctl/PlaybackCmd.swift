@@ -110,7 +110,8 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
                     deinterlaceFieldRate: DeinterlaceFieldRate = .field,
                     assertDolbyVision: Bool = false,
                     preserveASSMarkup: Bool = false,
-                    dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) -> Int32 {
+                    dolbyVisionHandling: DolbyVisionHandling = .automatic,
+                    preferDualLayerDolbyVision: Bool = false, record: URL? = nil) -> Int32 {
     EngineLog.handler = { print($0) }
     if mallocCensus {
         AetherEngine.setLargeAllocationCensusEnabled(
@@ -549,6 +550,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         // The base layer of a Dolby Vision source, the Dolby Vision left out of the container: the
         // harness for a record the bitstream contradicts.
         dolbyVisionHandling: dolbyVisionHandling,
+        preferDualLayerDolbyVision: preferDualLayerDolbyVision,
         panelPresentsDolbyVision: assertDolbyVision,
         isLive: live,
         dvrWindowSeconds: dvrWindow,

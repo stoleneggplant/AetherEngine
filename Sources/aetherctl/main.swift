@@ -71,7 +71,7 @@ func printUsage() {
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
-                 [--assert-dv] [--dv-base-layer]
+                 [--assert-dv] [--dv-base-layer] [--dual-layer] [--force-dual-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
@@ -107,6 +107,7 @@ func printUsage() {
                           (#92: SW-decode each segment in isolation; framesDecoded==0 => not independent)
       aetherctl disc-inspect <disc.iso>
       aetherctl dovitest [--out PATH.hevc] <file>
+      aetherctl felcompose [--frames N] [--start S] [--no-residual] [--dump DIR] [--dump-frames N] <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
@@ -161,6 +162,18 @@ func printUsage() {
                      its route. Also accepted by `play`.
 
     Flags (play only):
+      --dual-layer   AE#702: set LoadOptions.preferDualLayerDolbyVision, the
+                     opt-in to composing a Dolby Vision Profile 7 FEL on the
+                     software host (both layers on VideoToolbox, Metal
+                     composition). Still gated on a Dolby Vision display
+                     and hardware Dolby Vision decode, so on a Mac it also
+                     needs --assert-dv, and usually --force-dual-layer.
+      --force-dual-layer
+                     --dual-layer plus the TEST override that waives the
+                     display, Dolby Vision decode and FEL/MEL gates: any
+                     seekable HEVC Profile 7 file with length-prefixed
+                     samples composes, given a Metal GPU and hardware HEVC
+                     decode. `felcompose` runs the same decoder headless.
       --assert-dv    AE#493: set LoadOptions.panelPresentsDolbyVision,
                      the host's assertion that this display presents
                      Dolby Vision. macOS has no per-mode capability API
@@ -242,6 +255,19 @@ func printUsage() {
                 overwritten by the next run), or to --out PATH. Feed
                 that to `dovi_tool extract-rpu` + `info` to validate
                 the rewritten RPU against ground truth.
+
+      felcompose
+                AE#702: run the dual-layer Dolby Vision Profile 7 FEL
+                decoder (both layers on VideoToolbox, Metal
+                composition) over the first --frames N pictures
+                (default 48), from --start S, with no display and
+                none of the routing gates. Reports the layers' sizes,
+                how many frames composed with an enhancement picture,
+                and whether they carry the Dolby Vision attachments.
+                --dump DIR writes the first --dump-frames N (default 3)
+                as raw yuv420p10le; --no-residual composes the
+                prediction alone, so two dumps differ by exactly the
+                residual.
 
       swdecode  Open SoftwareVideoDecoder for the source's video
                 stream, feed packets, report counters + first-frame
@@ -447,6 +473,25 @@ if first == "disc-inspect" {
 }
 
 // DV P7 -> 8.1 converter validation harness.
+// AE#702: the dual-layer Profile 7 FEL decoder over a file, headless and ungated.
+if first == "felcompose" {
+    var rest = Array(args.dropFirst(2))
+    let frames = takeIntFlag("--frames", in: 1...100_000, from: &rest) ?? 48
+    let start = takeDoubleFlag("--start", from: &rest)
+    let noResidual = takeFlag("--no-residual", from: &rest)
+    let dump = takeStringFlag("--dump", from: &rest)
+    let dumpFrames = takeIntFlag("--dump-frames", in: 0...10_000, from: &rest) ?? 3
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: felcompose requires a <file> argument")
+        print("Usage: aetherctl felcompose [--frames N] [--start S] [--no-residual] [--dump DIR] [--dump-frames N] <file>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "felcompose")
+    exit(runFelCompose(url: parseSourceURL(urlArg), frames: frames, startSeconds: start,
+                       residual: !noResidual, dumpDirectory: dump, dumpFrames: dumpFrames))
+}
+
 if first == "dovitest" {
     var rest = Array(args.dropFirst(2))
     let outPath = takeStringFlag("--out", from: &rest)
@@ -650,6 +695,12 @@ if first == "play" {
     // `LoadOptions.dolbyVisionHandling = .baseLayerOnly`: the base layer of a Dolby Vision source, the
     // Dolby Vision left out of the container. The harness for a record the bitstream contradicts.
     let playDVHandling: DolbyVisionHandling = takeFlag("--dv-base-layer", from: &rest) ? .baseLayerOnly : .automatic
+    // AE#702: `LoadOptions.preferDualLayerDolbyVision`, the host's opt-in to composing a Profile 7 FEL.
+    // `--force-dual-layer` adds the test override that waives the display, Dolby Vision decode and FEL
+    // gates, which is the only way a Mac reaches the composition path at all.
+    let playForceDualLayer = takeFlag("--force-dual-layer", from: &rest)
+    let playDualLayer = takeFlag("--dual-layer", from: &rest) || playForceDualLayer
+    if playForceDualLayer { AetherEngine.setForceDualLayerDolbyVisionForTesting(true) }
     // AE#560: record the live source to a file from the session's existing connection.
     let playRecord = takeStringFlag("--record", from: &rest).map { URL(fileURLWithPath: $0) }
     // AE#492: `LoadOptions.deinterlaceFieldRate`. `send_field` (the default) emits one frame per
@@ -904,6 +955,7 @@ if first == "play" {
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
                  dolbyVisionHandling: playDVHandling,
+                 preferDualLayerDolbyVision: playDualLayer,
                  record: playRecord))
 }
 

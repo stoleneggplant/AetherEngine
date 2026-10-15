@@ -97,8 +97,50 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
     }
 
-    init(composer: DolbyVisionFELComposer? = DolbyVisionFELComposer()) {
+    /// `false` composes the prediction alone, dropping the enhancement picture: the A/B leg of
+    /// `AetherEngine.dualLayerDolbyVisionProbe`, whose difference from a full composition is exactly
+    /// the residual the enhancement layer adds.
+    private let appliesResidual: Bool
+
+    init(composer: DolbyVisionFELComposer? = DolbyVisionFELComposer(), appliesResidual: Bool = true) {
         self.composer = composer
+        self.appliesResidual = appliesResidual
+    }
+
+    /// What this decoder has delivered so far. Read off the compose queue, so it includes every
+    /// picture already handed on; never call it from `onFrame`, which runs on that queue.
+    struct Statistics: Sendable {
+        var composed = 0
+        var baseOnly = 0
+        var withEnhancement = 0
+        var enhancementWidth = 0
+        var enhancementHeight = 0
+        var hasComposer = false
+    }
+
+    var statistics: Statistics {
+        composeQueue.sync {
+            var stats = runningStatistics
+            stats.hasComposer = composer != nil
+            return stats
+        }
+    }
+
+    /// Compose queue only.
+    private var runningStatistics = Statistics()
+
+    /// Decode what has been fed and deliver it, without the flush's discard: both sessions finish
+    /// their frames, the pairing releases what it can, and the compose queue drains. For a harness
+    /// that stops feeding and wants every picture it fed; playback never calls it.
+    func finishDelivering() {
+        lock.lock()
+        let base = baseSession, enhancement = enhancementSession
+        lock.unlock()
+        for session in [enhancement, base].compactMap({ $0 }) {
+            VTDecompressionSessionFinishDelayedFrames(session)
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+        }
+        composeQueue.sync {}
     }
 
     /// What this device lacks for the path, or nil when it has it all: a Metal GPU for the composer,
@@ -517,8 +559,9 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         logDolbyVisionMetadataOnce(pair.base)
         var picture: CVPixelBuffer = pair.base
+        let enhancement = appliesResidual ? pair.enhancement : nil
         if let composer, let params,
-           let composed = composer.compose(base: pair.base, enhancement: pair.enhancement, params: params) {
+           let composed = composer.compose(base: pair.base, enhancement: enhancement, params: params) {
             // The base picture's attachments are the frame's: its colour and the rest of what
             // VideoToolbox propagates, then the Dolby Vision metadata by name, in whatever mode it was
             // attached, so a key VideoToolbox marks non-propagating is not lost on the copy.
@@ -528,6 +571,12 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
             Self.copyDolbyVisionMetadata(from: pair.base, to: composed)
             picture = composed
             composedCount += 1
+            runningStatistics.composed += 1
+            if let enhancement {
+                runningStatistics.withEnhancement += 1
+                runningStatistics.enhancementWidth = CVPixelBufferGetWidth(enhancement)
+                runningStatistics.enhancementHeight = CVPixelBufferGetHeight(enhancement)
+            }
             if !loggedFirstComposition {
                 loggedFirstComposition = true
                 EngineLog.emit(
@@ -539,6 +588,7 @@ final class DolbyVisionFELDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         } else {
             baseOnlyCount += 1
+            runningStatistics.baseOnly += 1
         }
         attachColour(picture)
         reportFormat(picture)

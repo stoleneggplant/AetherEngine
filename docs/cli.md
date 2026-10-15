@@ -10,6 +10,7 @@ swift run aetherctl segverify <url>      # SW-decode each loopback segment in is
 swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
 swift run aetherctl play <url>           # full load+play session smoke test: 1 Hz telemetry, cue log, host-call mimicry
 swift run aetherctl dovitest <url>       # convert a DV Profile 7 stream to 8.1, dump for dovi_tool
+swift run aetherctl felcompose <url>     # dual-layer DV Profile 7 FEL composition, headless (AE#702)
 swift run aetherctl pktdump <url>        # dump raw demuxer packet timing (dts/pts/keyframe) per open profile
 swift run aetherctl dualsubs <file> ...  # dual subtitle-track render probe (--primary / --secondary stream index)
 swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
@@ -475,6 +476,24 @@ Runs the Dolby Vision Profile 7 to 8.1 converter over every video packet of the 
 swift run aetherctl dovitest [--out PATH.hevc] <p7-source>
 dovi_tool extract-rpu -i <printed output path> -o out.rpu
 dovi_tool info -i out.rpu -f 0   # expect dovi_profile 8, disable_residual_flag true
+```
+
+## felcompose
+
+Runs the dual-layer Dolby Vision Profile 7 FEL decoder (AE#702) over a file with no display and none of the routing gates: both layers decoded by VideoToolbox, paired by presentation time, composed by the Metal kernel, exactly as `SoftwarePlaybackHost` runs them when `LoadOptions.preferDualLayerDolbyVision` routes a session there. It reports the layers' sizes, how many frames composed with an enhancement picture, how many went out as the base picture alone, and whether the delivered frames carry the undocumented `DolbyVisionRPUData` / `DolbyCompatibilityID` attachments the display layer reads. Backed by the public, test-only `AetherEngine.dualLayerDolbyVisionProbe(url:frames:startSeconds:residual:dumpDirectory:dumpFrames:options:)` returning `DualLayerDolbyVisionProbeResult`.
+
+```bash
+swift run aetherctl felcompose --frames 96 --start 600 --dump /tmp/fel <p7-fel-source>
+swift run aetherctl felcompose --frames 96 --start 600 --dump /tmp/pred --no-residual <p7-fel-source>
+ffmpeg -f rawvideo -pix_fmt yuv420p10le -s 3840x2160 -i /tmp/fel/<frame>.yuv -frames:v 1 fel.png
+```
+
+`--dump DIR` writes the first `--dump-frames N` (default 3) delivered frames as raw `yuv420p10le`, named by index and presentation time. `--no-residual` composes the prediction alone, so the two dumps above differ by exactly the residual the enhancement layer adds; the same frames out of DoViBaker or `vs-nlq` are the reference to diff the first against. On a Mac the run is expected to compose and to report the Dolby Vision attachments absent: there is no Dolby Vision decoder there to attach them, and whether they reach the panel is the device test's question. Exit codes: 0 composed, 2 not Profile 7, 3 no Metal composer, 4 nothing composed, 5 composed without any enhancement picture.
+
+To run the same path through a real session, `play --dual-layer` sets the option, and `play --force-dual-layer` adds the test-only `setForceDualLayerDolbyVisionForTesting` override that waives the display, Dolby Vision decode and FEL / MEL gates (a Metal GPU, hardware HEVC decode and a seekable source with length-prefixed samples are still required), which is how a Mac reaches it:
+
+```bash
+swift run aetherctl play --seconds 60 --assert-dv --force-dual-layer <p7-fel-source>
 ```
 
 ## pktdump

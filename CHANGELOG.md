@@ -32,6 +32,12 @@ the public-API contract.
   decoder that cannot open falls back to the single-layer VideoToolbox decoder instead of failing the
   load. The software host keeps its usual costs (picture on the device only, no Atmos passthrough),
   which is why the route is opt-in.
+- **`aetherctl felcompose` and `play --dual-layer` / `--force-dual-layer` test the FEL path on a
+  file.** `felcompose` runs the dual-layer decoder headless and ungated (`dualLayerDolbyVisionProbe`),
+  reports pairing, composition and the Dolby Vision attachments, and can dump frames as `yuv420p10le`,
+  with `--no-residual` for the prediction-only A/B. `play --force-dual-layer` routes a real session
+  through the composition with the test-only `setForceDualLayerDolbyVisionForTesting`, which is how a Mac
+  reaches it (AE#702).
 - **A DVD-Video ripped as a `VIDEO_TS` folder plays over HTTP, as a `BDMV` folder does.** A
   `DiscDirectoryReader` (or `HTTPDiscDirectoryReader`) whose listing holds `VIDEO_TS/` files is now read
   as DVD-Video: the title sets, VMGI filtering, durations, chapters and languages come from the same code
